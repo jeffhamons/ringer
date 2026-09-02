@@ -87,7 +87,10 @@ def write_patch_archives(canonical_patch: Path, patch_text: str) -> list[str]:
 def parse_owned_files(raw: str) -> list[str]:
     normalized = raw.replace("\\n", "\n").replace(";", "\n").replace(",", "\n")
     paths: list[str] = []
-    for line in normalized.splitlines():
+    # Repo paths never contain whitespace, so a space-separated list is
+    # accepted too (a quoted 'a b c' used to silently become one bogus path
+    # and fail every changed file as outside_owned_files).
+    for line in normalized.split():
         item = line.strip().strip("'\"")
         if not item:
             continue
