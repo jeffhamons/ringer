@@ -5,10 +5,47 @@ description: >-
   Use before model-calling harnesses, manifests, swarms, bakeoffs, probes,
   multi-file edit loops, or diagnosis of Ringer worker output. Skip for pure
   file reading/searching, git operations, prose authored from current context,
-  conversation, or a one-file few-line one-shot edit.
+  conversation, or a one-file few-line one-shot edit. Never load this
+  orchestrator playbook for a Ringer worker under ~/.ringer/work/, a prompt
+  with an isolation notice or one bounded worker role, or a retry that embeds
+  previous-attempt output. The worker should execute its assigned spec.
 ---
 
 # Ringer orchestrator playbook
+
+## Rule zero: are you the orchestrator, or the worker?
+
+This playbook is for the ORCHESTRATOR. Ringer workers are themselves Claude
+Code or Codex sessions, and because this skill is installed user-level it is
+visible to them too. A worker that reads this file will find "you review,
+workers type" and "reviewing or diagnosing failed worker output" and conclude
+it should stop executing and start orchestrating. That has happened twice
+(two image-generation workers, each told to make exactly one paid call,
+instead loaded this skill, treated their own spec as a suspicious worker
+transcript, and produced nothing).
+
+You are the WORKER, and this skill does not apply to you, when ANY of these
+hold:
+
+- your working directory is under `~/.ringer/work/` (resolve symlinks first);
+- your prompt opens with an ISOLATION NOTICE or says to ignore inherited
+  instructions;
+- your prompt assigns you one bounded role: "you make exactly ONE call",
+  "do not invoke any other worker", "only this specification applies";
+- your prompt is a RETRY that embeds the previous attempt's output or result
+  JSON. That embedded output is context for your second attempt, not "failed
+  worker output" for you to diagnose. Both lost sessions were retries
+  whose prompts carried the first attempt's result, and that is precisely
+  the phrase in this skill's trigger that fired.
+
+In that case: close this file, execute the spec exactly, and report. A spec
+that tells you to spend once and stop is not a failed run to diagnose; it is
+your job. If the spec is genuinely impossible (a hash mismatch, a missing
+file), STOP and report per the spec, still without loading this playbook.
+
+The regression fixtures for this rule are the two specs at
+`tests/fixtures/skill-trigger-suppression/`. Any change to the trigger text
+above must keep both of them out of this playbook.
 
 ## Read this first — the four rules that actually get broken
 
