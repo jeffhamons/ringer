@@ -1829,6 +1829,13 @@ class Manifest:
     repo: Path | None
     tasks: tuple[TaskSpec, ...]
     source_path: Path | None = None
+    # Hard ceiling on what this run may spend, in USD, enforced while it runs.
+    # None means unlimited, which is the historical behaviour.
+    budget_usd: float | None = None
+    # Stop the run once this many tasks have failed in a row with the SAME
+    # failure signature. A manifest whose deliverable is impossible fails every
+    # task identically; without this the run pays for all of them, twice.
+    abort_after_repeated_failures: int | None = None
 
     @classmethod
     def from_path(cls, path: Path) -> "Manifest":
@@ -1844,6 +1851,8 @@ class Manifest:
             repo=manifest.repo,
             tasks=manifest.tasks,
             source_path=path,
+            budget_usd=manifest.budget_usd,
+            abort_after_repeated_failures=manifest.abort_after_repeated_failures,
         )
 
     @classmethod
@@ -1870,6 +1879,18 @@ class Manifest:
         duplicates = sorted({key for key in keys if keys.count(key) > 1})
         if duplicates:
             raise ValueError(f"duplicate task keys: {', '.join(duplicates)}")
+        budget_raw = obj.get("budget_usd")
+        budget_usd: float | None = None
+        if budget_raw is not None:
+            budget_usd = float(budget_raw)
+            if budget_usd <= 0:
+                raise ValueError("budget_usd must be positive")
+        abort_raw = obj.get("abort_after_repeated_failures")
+        abort_after: int | None = None
+        if abort_raw is not None:
+            abort_after = int(abort_raw)
+            if abort_after <= 0:
+                raise ValueError("abort_after_repeated_failures must be positive")
         worktrees = bool(obj.get("worktrees", False))
         if worktrees and repo is None:
             raise ValueError(
@@ -1896,6 +1917,8 @@ class Manifest:
             worktrees=worktrees,
             repo=repo,
             tasks=tasks,
+            budget_usd=budget_usd,
+            abort_after_repeated_failures=abort_after,
         )
 
     def with_max_parallel(self, value: int | None) -> "Manifest":
@@ -1911,10 +1934,47 @@ class Manifest:
             repo=self.repo,
             tasks=self.tasks,
             source_path=self.source_path,
+            budget_usd=self.budget_usd,
+            abort_after_repeated_failures=self.abort_after_repeated_failures,
         )
 
 
 FILE_TEST_OPS = {"-e", "-f", "-s", "-d", "-r", "-w", "-x", "-L"}
+
+
+def worker_unwritable_paths(task: TaskSpec, manifest: Manifest) -> list[str]:
+    """Absolute paths a spec orders the worker to write that its sandbox refuses.
+
+    A worker may write inside its own task directory and its assigned temp dir,
+    and nowhere else. A spec naming an absolute path outside that -- and listing
+    it in expect_files, so the file is genuinely expected from the worker rather
+    than merely mentioned -- describes an impossible task. Every attempt fails,
+    and every attempt is retried.
+
+    The distinction that matters: an absolute expect_files entry is perfectly
+    normal when the CHECK produces it (the fix-swarm pattern exports a patch out
+    of the worktree that way). It is only wrong when the SPEC hands that path to
+    the worker. So the spec text is what decides.
+
+    Found the hard way: a scout worker located its answer in four tool calls and
+    then spent about forty more trying `write`, `cat >`, `dd`, `cp`, python and
+    `xattr` against a path it was never allowed to touch.
+    """
+    if not task.expect_files:
+        return []
+    taskdir = (manifest.workdir / task.key).resolve()
+    offenders: list[str] = []
+    for raw in task.expect_files:
+        path = str(raw)
+        if not os.path.isabs(path):
+            continue
+        resolved = Path(path).resolve()
+        if resolved == taskdir or taskdir in resolved.parents:
+            continue
+        if path not in task.spec:
+            continue
+        offenders.append(path)
+    return offenders
 
 
 def lint_manifest(
@@ -1951,6 +2011,12 @@ def lint_manifest(
                     f"args_template. Add {{engine_args}} to engines.{task.engine}.args_template "
                     "in config.toml, or remove the field."
                 )
+        for unreachable in worker_unwritable_paths(task, manifest):
+            findings.append(
+                f"{task.key}: the spec tells the worker to write {unreachable}, which its "
+                f"sandbox forbids -- a worker may only write inside its own task directory. "
+                f"Have the worker write a relative path and export it in the check."
+            )
         if manifest.worktrees and any(is_relative_expect_file(path) for path in task.expect_files):
             findings.append(
                 f"{task.key}: deliverable would be deleted with the worktree; write it outside the worktree or export it in the check."
@@ -2256,6 +2322,11 @@ class TaskRuntime:
     ended_at_monotonic: float | None = None
     worker_pid: int | None = None
     tokens: int | None = None
+    # What the provider actually charged for this task, summed across every
+    # model step in its log, and how many steps that took. `tokens` above is a
+    # single step and cannot be used for money -- see parse_step_costs.
+    cost_usd: float | None = None
+    model_steps: int = 0
     final_verdict: str | None = None
     last_check_returncode: int | None = None
     last_check_timed_out: bool = False
@@ -9333,6 +9404,11 @@ class RingerRunner:
         # wrapper-script engines resolve fine and then exit 127 when the
         # binary INSIDE the wrapper is missing.)
         self.infra_failed_engines: set[str] = set()
+        # Set once when the run must stop early: budget spent, or the same
+        # failure repeating. Tasks that have not started check it and skip.
+        self.stop_reason: str | None = None
+        self.recent_failure_signature: str | None = None
+        self.repeated_failures: int = 0
 
     async def run(self) -> int:
         self.manifest.workdir.mkdir(parents=True, exist_ok=True)
@@ -9423,8 +9499,79 @@ class RingerRunner:
             runtime, runtime.task.spec, attempt > 1, effective_worker, verify, "ENGINE_DOWN", duration_ms
         )
 
+    def run_cost_usd(self) -> float:
+        """What this run has cost so far, summed from what providers reported."""
+        with self.lock:
+            return sum(r.cost_usd or 0.0 for r in self.runtimes)
+
+    def _refresh_cost(self, runtime: TaskRuntime) -> None:
+        """Re-read the task's log; it accumulates across attempts, so this is total."""
+        cost, steps = parse_step_costs(runtime.log_path)
+        with self.lock:
+            if cost is not None:
+                runtime.cost_usd = cost
+            runtime.model_steps = steps
+
+    async def _note_failure(self, runtime: TaskRuntime, verify: Any) -> None:
+        """Track identical consecutive failures so an impossible manifest stops early.
+
+        The signature is the check's exit code plus the first meaningful line it
+        printed. A manifest that asks for something no worker can produce fails
+        every task the same way; that is the shape worth stopping on, and it is
+        distinguishable from a run where several different things went wrong.
+        """
+        limit = self.manifest.abort_after_repeated_failures
+        if not limit:
+            return
+        first_line = ""
+        for line in (getattr(verify, "raw_output_excerpt", "") or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                first_line = stripped[:200]
+                break
+        signature = f"rc={getattr(verify, 'check_returncode', None)}|{first_line}"
+        with self.lock:
+            if signature == self.recent_failure_signature:
+                self.repeated_failures += 1
+            else:
+                self.recent_failure_signature = signature
+                self.repeated_failures = 1
+            tripped = self.repeated_failures >= limit and self.stop_reason is None
+            if tripped:
+                self.stop_reason = (
+                    f"{self.repeated_failures} tasks failed in a row with the same "
+                    f"failure ({first_line or 'no output'}) -- stopping rather than "
+                    f"paying for the rest of the manifest"
+                )
+        if tripped:
+            print(f"\n*** RUN STOPPED: {self.stop_reason} ***", flush=True)
+            await self.kill_all_workers()
+
+    async def _check_budget(self) -> None:
+        budget = self.manifest.budget_usd
+        if not budget:
+            return
+        spent = self.run_cost_usd()
+        if spent < budget:
+            return
+        with self.lock:
+            if self.stop_reason is not None:
+                return
+            self.stop_reason = f"budget of ${budget:.2f} reached (spent ${spent:.2f})"
+        print(f"\n*** RUN STOPPED: {self.stop_reason} ***", flush=True)
+        await self.kill_all_workers()
+
     async def _run_task(self, runtime: TaskRuntime) -> None:
         async with self.semaphore:
+            with self.lock:
+                stopped = self.stop_reason
+            if stopped is not None:
+                with self.lock:
+                    runtime.status = "fail"
+                    runtime.final_verdict = "SKIPPED"
+                    runtime.setup_error = f"not started: {stopped}"
+                    runtime.ended_at_monotonic = time.monotonic()
+                return
             with self.lock:
                 runtime.started_at_monotonic = time.monotonic()
                 engine_broken = runtime.task.engine in self.infra_failed_engines
@@ -9480,6 +9627,10 @@ class RingerRunner:
                         runtime, reason, worker=worker, attempt=attempt, duration_ms=duration_ms
                     )
                     return
+                # Money is counted the moment the worker stops, before the check
+                # runs, so a budget cannot be overshot by a slow verification.
+                self._refresh_cost(runtime)
+                await self._check_budget()
                 verify = await self.verifier.verify(runtime.task, runtime.taskdir)
                 verdict = verdict_for(worker, verify)
                 with self.lock:
@@ -9511,6 +9662,16 @@ class RingerRunner:
                             "binary never ran. Not retrying — fix the engine "
                             "'bin'/PATH in the ringer config and re-run.\n",
                         )
+                if verdict in {"FAIL", "TIMEOUT"}:
+                    await self._note_failure(runtime, verify)
+                with self.lock:
+                    stopped = self.stop_reason
+                if stopped is not None and verdict != "PASS":
+                    with self.lock:
+                        runtime.status = "fail"
+                        runtime.final_verdict = verdict
+                        runtime.ended_at_monotonic = time.monotonic()
+                    return
                 if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
                     failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
                     current_spec = (
@@ -10233,6 +10394,53 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def parse_step_costs(log_path: Path) -> tuple[float | None, int]:
+    """Sum what the provider says each model call cost, from the worker's own log.
+
+    Engines that stream JSON events report a per-step `cost` alongside the token
+    counts. Summing those is exact: it needs no price catalog, no assumption
+    about the prompt/completion split, and it stays right when a provider
+    discounts or caches.
+
+    This exists because `worker_tokens` records ONE step, not the sum -- the
+    token regex reads a single figure out of the tail of the stream. Measured on
+    real tasks the gap is 19x to 40x, which is how a $41.71 swarm reported as
+    roughly $3 and was restarted sixteen times by an operator who had no way to
+    see otherwise.
+
+    Returns (usd, steps). usd is None when the log carries no cost data at all
+    (a plan-billed or non-JSON engine), which is different from a run that
+    genuinely cost nothing.
+    """
+    total = 0.0
+    steps = 0
+    saw_cost = False
+    try:
+        handle = log_path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None, 0
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "step_finish":
+                continue
+            steps += 1
+            part = event.get("part")
+            if not isinstance(part, dict):
+                continue
+            cost = part.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                total += float(cost)
+                saw_cost = True
+    return (total if saw_cost else None), steps
+
+
 def parse_token_count(text: str, token_regex: str | None = DEFAULT_TOKEN_REGEX) -> int | None:
     # Engines colorize stdout when FORCE_COLOR is set (Claude Code, most CI),
     # leaving escape bytes between the label and the number that no practical
@@ -10913,17 +11121,28 @@ def print_lint_findings(findings: list[str]) -> None:
 def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
     print("\nSummary")
     print(f"run_id: {run_id}")
-    header = f"{'task':<24} {'status':<8} {'verdict':<8} {'attempts':>8} {'tokens':>10} {'elapsed_s':>10}"
+    header = (
+        f"{'task':<24} {'status':<8} {'verdict':<8} {'attempts':>8} "
+        f"{'steps':>6} {'USD':>8} {'elapsed_s':>10}"
+    )
     print(header)
     print("-" * len(header))
     now = time.monotonic()
     for runtime in runtimes:
-        tokens = "" if runtime.tokens is None else str(runtime.tokens)
+        usd = "" if runtime.cost_usd is None else f"{runtime.cost_usd:.3f}"
         print(
             f"{runtime.task.key:<24} {runtime.status:<8} "
             f"{(runtime.final_verdict or ''):<8} {runtime.attempts:>8} "
-            f"{tokens:>10} {runtime.elapsed_s(now):>10.1f}"
+            f"{runtime.model_steps:>6} {usd:>8} {runtime.elapsed_s(now):>10.1f}"
         )
+    priced = [r for r in runtimes if r.cost_usd is not None]
+    if priced:
+        total = sum(r.cost_usd or 0.0 for r in priced)
+        steps = sum(r.model_steps for r in runtimes)
+        print(f"\nrun cost: ${total:.2f} over {steps} model steps, as reported by the provider")
+        unpriced = [r.task.key for r in runtimes if r.cost_usd is None and r.model_steps]
+        if unpriced:
+            print(f"  (not included, engine reports no per-step cost: {', '.join(unpriced)})")
     setup_failures = [r for r in runtimes if r.setup_error]
     if setup_failures:
         print("\nsetup failures (no worker was spawned):")
