@@ -1073,6 +1073,21 @@ def load_artifact_config(raw: Any, state_dir: Path) -> ArtifactConfig:
     )
 
 
+# Task types that change a product and therefore answer to a requirement. A
+# bakeoff, probe or research task legitimately serves none, so the finding is
+# scoped rather than universal.
+#
+# The default is only the canonical vocabulary this project documents. Estates
+# that coin their own product task types -- "dotnet-fix", "juce-test", whatever
+# their stack is called -- extend it in config rather than here:
+#
+#   ticketed_task_types = ["code-fix", "code-feature", "dotnet-fix"]
+#
+# Hard-coding one estate's stack into everyone's linter is how a shared tool
+# stops being shared.
+DEFAULT_TICKETED_TASK_TYPES = frozenset({"code-fix", "code-feature"})
+
+
 @dataclass(frozen=True)
 class AppConfig:
     path: Path | None
@@ -1088,6 +1103,9 @@ class AppConfig:
     steering: SteeringConfig = field(default_factory=SteeringConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
     engine_bin_diagnostics: tuple[EngineBinDiagnostic, ...] = ()
+    # Which task types must name a ticket. Estate-specific by nature; see
+    # DEFAULT_TICKETED_TASK_TYPES.
+    ticketed_task_types: frozenset[str] = DEFAULT_TICKETED_TASK_TYPES
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1120,6 +1138,15 @@ class AppConfig:
         )
         artifact_config = load_artifact_config(data.get("artifact"), state_dir)
         update_config = load_update_config(data.get("update"))
+        raw_ticketed = data.get("ticketed_task_types")
+        if raw_ticketed is None:
+            ticketed_task_types = DEFAULT_TICKETED_TASK_TYPES
+        elif not isinstance(raw_ticketed, list):
+            raise ValueError("ticketed_task_types must be a list of task-type names")
+        else:
+            ticketed_task_types = frozenset(
+                str(item).strip() for item in raw_ticketed if str(item).strip()
+            )
         try:
             steering_config = load_steering_config(data.get("steering"))
         except Exception:
@@ -1140,6 +1167,7 @@ class AppConfig:
             steering=steering_config,
             update=update_config,
             engine_bin_diagnostics=engine_bin_diagnostics,
+            ticketed_task_types=ticketed_task_types,
         )
 
 
@@ -1977,10 +2005,6 @@ class Manifest:
 FILE_TEST_OPS = {"-e", "-f", "-s", "-d", "-r", "-w", "-x", "-L"}
 
 
-# Task types that change a product and therefore answer to a requirement. A
-# bakeoff, probe or research task legitimately serves none, so the lint finding
-# is scoped rather than universal.
-TICKETED_TASK_TYPES = frozenset({"code-fix", "code-feature", "dotnet-fix", "dotnet-feature"})
 
 
 def worker_unwritable_paths(task: TaskSpec, manifest: Manifest) -> list[str]:
@@ -2027,6 +2051,7 @@ def lint_manifest(
     allow_noncanonical_route: bool = False,
 ) -> list[str]:
     findings: list[str] = []
+    ticketed_types = config.ticketed_task_types if config else DEFAULT_TICKETED_TASK_TYPES
     if manifest.run_name == MODEL_SCOREBOARD_RUN_NAME:
         findings.append("manifest: run_name model-scoreboard is reserved for the scoreboard page.")
 
@@ -2052,7 +2077,7 @@ def lint_manifest(
                     f"args_template. Add {{engine_args}} to engines.{task.engine}.args_template "
                     "in config.toml, or remove the field."
                 )
-        if task.task_type in TICKETED_TASK_TYPES and not task.ticket:
+        if task.task_type in ticketed_types and not task.ticket:
             findings.append(
                 f"{task.key}: {task.task_type} names no ticket, so its cost and outcome "
                 f"cannot be attributed to a requirement. Set \"ticket\"."
@@ -11926,7 +11951,6 @@ def run_persistent_hud(config: AppConfig, *, port: int | None, open_viewer: bool
         server.stop()
 
 
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ringer.py",
@@ -12294,7 +12318,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"ringer.py: error: {exc}", file=sys.stderr)
         return 2
-
 
 
 if __name__ == "__main__":
