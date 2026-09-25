@@ -4,8 +4,9 @@
 # OpenCode has no OS-level sandbox of its own — its --dangerously-skip-permissions
 # flag (required for headless runs) disables ALL of its interactive approval
 # prompts. This wrapper supplies the real containment: full network and reads,
-# writes confined to the task dir, a per-run scratch/cache dir, and OpenCode's
-# own state dirs.
+# writes confined to the task dir, a per-run scratch/cache dir, OpenCode's own
+# state dirs, and — when the task dir is a linked Git worktree — that worktree's
+# own gitdir plus the shared object store so `git add` can run.
 #
 # Usage (as a ringer engine bin):
 #   opencode-sandboxed.sh <taskdir> [--no-sandbox] <opencode args...>
@@ -39,6 +40,42 @@ fi
 
 TASKDIR_REAL="$(cd "$TASKDIR" && pwd -P)"
 
+# A task dir that is a linked Git worktree keeps its index in a per-worktree
+# gitdir and its new objects in the shared object store, both outside TASKDIR.
+# Resolve those canonical paths with Git so `git add` can write them without
+# opening the common gitdir (hooks/config/refs stay denied). Plain directories
+# and non-worktree task dirs simply resolve to nothing.
+WORKTREE_GITDIR=""
+WORKTREE_OBJECTS=""
+if command -v git >/dev/null 2>&1 \
+  && [ "$(git -C "$TASKDIR_REAL" rev-parse --is-inside-work-tree 2>/dev/null || true)" = "true" ]; then
+  gitdir="$(git -C "$TASKDIR_REAL" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  commondir="$(git -C "$TASKDIR_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$gitdir" ] && [ -n "$commondir" ]; then
+    commondir_real="$(cd "$commondir" 2>/dev/null && pwd -P || true)"
+    # Only a registered linked worktree has a gitdir directly below the
+    # common directory's worktrees/ directory. A task-controlled .git file
+    # must not nominate an arbitrary gitdir or an unrelated object store.
+    # The back-pointer must identify this task directory as the worktree root.
+    worktrees="$commondir_real/worktrees"
+    if [ -n "$commondir_real" ] && [ ! -L "$gitdir" ] \
+      && [ -d "$gitdir" ] && [ ! -L "$worktrees" ] \
+      && [ -d "$worktrees" ] && [ -f "$gitdir/gitdir" ]; then
+      gitdir_real="$(cd "$gitdir" && pwd -P)"
+      worktrees_real="$(cd "$worktrees" && pwd -P)"
+      owner_gitfile="$(< "$gitdir/gitdir")"
+      if [ "$(dirname "$gitdir_real")" = "$worktrees_real" ] \
+        && [ "$owner_gitfile" = "$TASKDIR_REAL/.git" ]; then
+        WORKTREE_GITDIR="$gitdir_real"
+        objects="$commondir/objects"
+        if [ ! -L "$objects" ] && [ -d "$objects" ]; then
+          WORKTREE_OBJECTS="$(cd "$objects" && pwd -P)"
+        fi
+      fi
+    fi
+  fi
+fi
+
 # Per-run scratch root — becomes both TMPDIR and XDG_CACHE_HOME for OpenCode, so
 # we never have to open all of /private/tmp or ~/.cache to the sandboxed agent.
 # Resolve to the real path (/var/folders symlinks to /private/var/folders);
@@ -59,7 +96,25 @@ cat > "$PROFILE" <<'SBEOF'
   (subpath (param "SCRATCH"))
   (subpath (param "OC_SHARE"))
   (subpath (param "OC_STATE"))
-  (subpath (param "OC_CONFIG")))
+  (subpath (param "OC_CONFIG"))
+SBEOF
+
+# Open the linked worktree's own gitdir and the shared object store for git
+# writes. Each rule is emitted only when its canonical target resolved, and the
+# common gitdir itself (hooks/config/info/packed-refs/refs) stays denied.
+if [ -n "$WORKTREE_GITDIR" ]; then
+  cat >> "$PROFILE" <<'SBEOF'
+  (subpath (param "WORKTREE_GITDIR"))
+SBEOF
+fi
+if [ -n "$WORKTREE_OBJECTS" ]; then
+  cat >> "$PROFILE" <<'SBEOF'
+  (subpath (param "WORKTREE_OBJECTS"))
+SBEOF
+fi
+
+cat >> "$PROFILE" <<'SBEOF'
+)
 ; /dev is needed for /dev/null, /dev/urandom, etc.; writes there can't create
 ; persistent files without root, so a few literals are allowed rather than via param.
 (allow file-write-data
@@ -72,15 +127,25 @@ export TMPDIR="$SCRATCH"
 export XDG_CACHE_HOME="$SCRATCH/cache"
 mkdir -p "$XDG_CACHE_HOME"
 
+SANDBOX_ARGS=(
+  -D "TASKDIR=$TASKDIR_REAL"
+  -D "SCRATCH=$SCRATCH"
+  -D "OC_SHARE=$HOME/.local/share/opencode"
+  -D "OC_STATE=$HOME/.local/state/opencode"
+  -D "OC_CONFIG=$HOME/.config/opencode"
+)
+if [ -n "$WORKTREE_GITDIR" ]; then
+  SANDBOX_ARGS+=(-D "WORKTREE_GITDIR=$WORKTREE_GITDIR")
+fi
+if [ -n "$WORKTREE_OBJECTS" ]; then
+  SANDBOX_ARGS+=(-D "WORKTREE_OBJECTS=$WORKTREE_OBJECTS")
+fi
+
 # Run as a child (not exec) so the EXIT trap fires and cleans up the profile +
 # scratch dir even on the success path; propagate the child's exit status.
 set +e
 /usr/bin/sandbox-exec \
-  -D "TASKDIR=$TASKDIR_REAL" \
-  -D "SCRATCH=$SCRATCH" \
-  -D "OC_SHARE=$HOME/.local/share/opencode" \
-  -D "OC_STATE=$HOME/.local/state/opencode" \
-  -D "OC_CONFIG=$HOME/.config/opencode" \
+  "${SANDBOX_ARGS[@]}" \
   -f "$PROFILE" "$OPENCODE_BIN" "$@" < /dev/null
 status=$?
 set -e
