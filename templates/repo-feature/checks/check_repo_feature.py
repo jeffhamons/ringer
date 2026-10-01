@@ -23,19 +23,12 @@ def path_allowed(path: str, allowed: list[str]) -> bool:
             continue
         if normalized == candidate or normalized.startswith(candidate + "/"):
             return True
-        if candidate.startswith(normalized + "/"):
-            return True
     return False
 
 
 def staged_path_owned(path: str, owned: list[str]) -> bool:
     """A staged file must be the named file or inside a named directory."""
-    normalized = path.strip().rstrip("/")
-    return any(
-        normalized == candidate or normalized.startswith(candidate + "/")
-        for raw in owned
-        if (candidate := raw.strip().rstrip("/"))
-    )
+    return path_allowed(path, owned)
 
 
 def harvest_staged_files(stage_dir: str, repo: pathlib.Path, owned: list[str]) -> tuple[int, bool]:
@@ -203,7 +196,10 @@ def main() -> int:
     if proc.stderr.strip():
         print(proc.stderr[-1000:])
 
-    status = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, timeout=60)
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo, capture_output=True, text=True, timeout=60,
+    )
     if status.returncode != 0:
         print("FAIL: git status failed")
         print(status.stderr)

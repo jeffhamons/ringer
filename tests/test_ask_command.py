@@ -275,6 +275,38 @@ class AskCommandTests(unittest.TestCase):
             self.assertNotIn("re_FAKEaskworker123", worker_log)
             self.assertIn("Authorization: Bearer [REDACTED]", worker_log)
 
+    def test_default_request_scrubs_detectable_credentials_from_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            home = root / "home"
+            workdir = root / "request"
+            worker = root / "answer_worker.py"
+            home.mkdir()
+            worker.write_text(
+                "from pathlib import Path\n"
+                "Path('answer.md').write_text('Done.\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            config = self.write_config(root, worker)
+            secret = "re_FAKErequestcredential123"
+            request = f"Explain this result with api_key={secret}"
+            proc = self.run_in_process(
+                [
+                    "ask", request, "--engine", "answer-mock", "--config", str(config),
+                    "--workdir", str(workdir), "--identity", "ask-scrub-test",
+                ],
+                home=home,
+            )
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            records = [
+                (workdir / "answer" / "worker.log").read_text(encoding="utf-8"),
+                next((root / "state" / "runs").glob("*.json")).read_text(encoding="utf-8"),
+                (root / "runs.jsonl").read_text(encoding="utf-8"),
+            ]
+            for record in records:
+                self.assertNotIn(secret, record)
+                self.assertIn("Explain this result", record)
+
     def test_existing_answer_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_root:
             workdir = Path(temp_root) / "request"

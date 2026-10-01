@@ -2621,19 +2621,19 @@ class StateWriter:
                     "spec": (
                         "[redacted request packet]"
                         if runtime.task.redact_spec
-                        else runtime.task.spec
+                        else redact_secrets(runtime.task.spec)
                     ),
                     "spec_short": (
                         "[redacted request packet]"
                         if runtime.task.redact_spec
-                        else runtime.spec_short
+                        else redact_secrets(runtime.spec_short)
                     ),
                     "verified": runtime.task.verified,
-                    "check": runtime.task.check,
+                    "check": redact_secrets(runtime.task.check),
                     "check_returncode": runtime.last_check_returncode,
                     "check_timed_out": runtime.last_check_timed_out,
                     "check_output_tail": shorten(runtime.last_check_output, 4000),
-                    "setup_error": runtime.setup_error,
+                    "setup_error": redact_secrets(runtime.setup_error) if runtime.setup_error else None,
                     "timeout_s": runtime.task.timeout_s,
                     "max_attempts": runtime.task.max_attempts,
                     "taskdir": str(runtime.taskdir),
@@ -10245,7 +10245,7 @@ class RingerRunner:
             "\n"
             f"[ringer.py] attempt {attempt} started {datetime.now(timezone.utc).isoformat()}\n"
             f"[ringer.py] engine: {runtime.task.engine}\n"
-            f"[ringer.py] command: {shell_command_for_display(display_cmd)} < /dev/null\n",
+            f"[ringer.py] command: {redact_secrets(shell_command_for_display(display_cmd))} < /dev/null\n",
         )
         capture = RollingBytes(max_bytes=1_000_000)
         try:
@@ -11549,13 +11549,13 @@ def dry_run(
         else:
             print("    full_access: false")
         print(f"    expect_files: {list(task.expect_files)}")
-        print(f"    check: {task.check}")
+        print(f"    check: {redact_secrets(task.check)}")
         if engine is None:
             print("    command: ERROR unknown engine")
         elif task.full_access and not config.allow_full_access:
             print("    command: ERROR full_access requires allow_full_access=true in config")
         else:
-            print(f"    command: {shell_command_for_display(cmd)} < /dev/null")
+            print(f"    command: {redact_secrets(shell_command_for_display(cmd))} < /dev/null")
 
 
 def print_lint_findings(findings: list[str]) -> None:

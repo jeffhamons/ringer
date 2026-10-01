@@ -100,6 +100,12 @@ class RepoFeatureCheckTest(unittest.TestCase):
         self.assertIn("staged file outside owned paths: tests", proc.stdout)
         self.assertFalse((self.repo / "tests").exists())
 
+    def test_direct_parent_file_is_not_owned_by_child_path(self) -> None:
+        (self.repo / "tests").write_text("PARENT FILE\n", encoding="utf-8")
+        proc = self.run_check(owned="gate/vm_pull.py,tests/test_vm_pull.py")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("unexpected repo change outside owned/allowed paths", proc.stdout)
+
     def test_staged_git_path_is_refused(self) -> None:
         self.stage(".git/hooks/post-checkout", "#!/bin/sh\n")
         proc = self.run_check(owned=".git/hooks/post-checkout,gate/vm_pull.py")
