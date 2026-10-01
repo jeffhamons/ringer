@@ -119,7 +119,7 @@ class UnwritableDeliverableLintTests(unittest.TestCase):
             "workdir": workdir,
             "max_parallel": 1,
             "worktrees": worktrees,
-            "repo": None,
+            "repo": workdir,
             "tasks": [{
                 "key": "scout1",
                 "spec": spec,
@@ -157,7 +157,7 @@ class UnwritableDeliverableLintTests(unittest.TestCase):
             "workdir": workdir,
             "max_parallel": 1,
             "worktrees": True,
-            "repo": None,
+            "repo": workdir,
             "tasks": [{
                 "key": "scout1",
                 "spec": f"Write {inside}",

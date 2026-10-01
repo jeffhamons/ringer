@@ -9954,8 +9954,6 @@ class RingerRunner:
                             "binary never ran. Not retrying — fix the engine "
                             "'bin'/PATH in the ringer config and re-run.\n",
                         )
-                if verdict in {"FAIL", "TIMEOUT"}:
-                    await self._note_failure(runtime, verify)
                 with self.lock:
                     stopped = self.stop_reason
                 if stopped is not None and verdict != "PASS":
@@ -10416,7 +10414,7 @@ class RingerRunner:
                 "spec": (
                     "[redacted request packet]"
                     if runtime.task.redact_spec
-                    else spec[:500]
+                    else redact_secrets(spec[:2000])
                 ),
                 "worker_engine": runtime.task.engine,
                 "shepherd_model": SHEPHERD_MODEL,
