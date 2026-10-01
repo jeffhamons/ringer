@@ -28,6 +28,16 @@ def path_allowed(path: str, allowed: list[str]) -> bool:
     return False
 
 
+def staged_path_owned(path: str, owned: list[str]) -> bool:
+    """A staged file must be the named file or inside a named directory."""
+    normalized = path.strip().rstrip("/")
+    return any(
+        normalized == candidate or normalized.startswith(candidate + "/")
+        for raw in owned
+        if (candidate := raw.strip().rstrip("/"))
+    )
+
+
 def harvest_staged_files(stage_dir: str, repo: pathlib.Path, owned: list[str]) -> tuple[int, bool]:
     """Install files staged at <stage_dir>/<repo-rel> into the repo.
 
@@ -55,7 +65,11 @@ def harvest_staged_files(stage_dir: str, repo: pathlib.Path, owned: list[str]) -
     repo_resolved = repo.resolve()
     staged: list[tuple[pathlib.Path, str]] = []
     if not refusals:
-        for dirpath, _dirnames, filenames in os.walk(stage):
+        for dirpath, dirnames, filenames in os.walk(stage):
+            for name in dirnames:
+                nested = pathlib.Path(dirpath) / name
+                if nested.is_symlink():
+                    refusals.append(f"staged directory is a symlink: {nested.relative_to(stage)}")
             for name in filenames:
                 src = pathlib.Path(dirpath) / name
                 rel = src.relative_to(stage).as_posix()
@@ -68,7 +82,7 @@ def harvest_staged_files(stage_dir: str, repo: pathlib.Path, owned: list[str]) -
                 if ".git" in rel.split("/"):
                     refusals.append(f"staged path may not touch .git: {rel}")
                     continue
-                if not path_allowed(rel, owned):
+                if not staged_path_owned(rel, owned):
                     refusals.append(f"staged file outside owned paths: {rel}")
                     continue
                 dest = repo / rel

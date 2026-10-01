@@ -93,6 +93,13 @@ class RepoFeatureCheckTest(unittest.TestCase):
         self.assertEqual((self.repo / "gate" / "vm_pull.py").read_text(encoding="utf-8"), "BASE\n")
         self.assertFalse((self.repo / "gate" / "unowned.py").exists())
 
+    def test_staged_parent_file_is_not_owned_by_child_path(self) -> None:
+        self.stage("tests", "PARENT FILE\n")
+        proc = self.run_check(owned="gate/vm_pull.py,tests/test_vm_pull.py")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("staged file outside owned paths: tests", proc.stdout)
+        self.assertFalse((self.repo / "tests").exists())
+
     def test_staged_git_path_is_refused(self) -> None:
         self.stage(".git/hooks/post-checkout", "#!/bin/sh\n")
         proc = self.run_check(owned=".git/hooks/post-checkout,gate/vm_pull.py")
@@ -110,6 +117,19 @@ class RepoFeatureCheckTest(unittest.TestCase):
         proc = self.run_check()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("symlink", proc.stdout)
+        self.assertEqual((self.repo / "gate" / "vm_pull.py").read_text(encoding="utf-8"), "BASE\n")
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_staged_symlink_directory_is_refused(self) -> None:
+        outside = self.taskdir / "outside"
+        outside.mkdir()
+        (outside / "vm_pull.py").write_text("MIRROR\n", encoding="utf-8")
+        stage_root = self.taskdir / "output" / "repo"
+        stage_root.mkdir(parents=True)
+        (stage_root / "gate").symlink_to(outside)
+        proc = self.run_check()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("staged directory is a symlink", proc.stdout)
         self.assertEqual((self.repo / "gate" / "vm_pull.py").read_text(encoding="utf-8"), "BASE\n")
 
     @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
