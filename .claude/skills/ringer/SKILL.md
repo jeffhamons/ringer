@@ -114,9 +114,10 @@ is too large for the packet it says so and stops before the model call rather
 than letting a worker guess — but a source small enough to fit whole is sent
 whole, relevant or not, so choosing the sources IS the work. Directory scans
 stay inside the tree you name; a symlink leading out of it is skipped and
-reported. Runs appear on Ringside like any other, and `--redact` hides the
-request from Ringer's own state and eval records — it cannot scrub raw worker
-output, which is captured verbatim by design.
+reported. Runs appear on Ringside like any other. `--redact` hides the request
+from Ringer's state and eval records; worker output is redacted before it is
+shown or written to a log. Review older logs separately because this does not
+rewrite existing files.
 
 **Be honest about what it verifies.** The check is that `answer.md` exists and
 is non-empty. That is the weakest check in the tool, and it is also the best
@@ -368,7 +369,7 @@ someone's untracked scratch files.
 ## Post-run review ritual
 
 1. Read the run JSON in `~/.ringer/runs/` — statuses, retries, durations.
-2. For any retried or failed task, read the raw worker log in
+2. For any retried or failed task, read the worker log in
    `<workdir>/logs/` before deciding anything. Retries that passed on
    attempt 2 often reveal a spec ambiguity worth fixing in your next
    manifest.
@@ -527,8 +528,8 @@ to a shepherd until the cause is understood.
 ## Baked-in invariants (preserve in any change to ringer.py)
 
 Stdin closed (`< /dev/null`); sandbox mode explicit; verification executes
-the artifact; logs carry raw worker output only. These are load-bearing —
-engine and invocation changes must keep all four.
+the artifact; worker output is redacted before display or log persistence.
+These are load-bearing — engine and invocation changes must keep all four.
 
 For reviewer fallbacks, compare `expect_files` with the actual `<workdir>/<task-key>/` layout before launch. A parent-directory expectation paired with a taskdir-relative checker can fail after a clean lint; fix the path and lint without spending another model attempt when the artifact is otherwise available.
 ## Scoped operator overrides
