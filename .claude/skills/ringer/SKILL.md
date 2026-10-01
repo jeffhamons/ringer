@@ -1,23 +1,11 @@
 ---
 name: ringer
 description: >-
-  Orchestrator playbook and routing rules for Ringer, the verified-swarm
-  delegation tool (ringer.py). TRIGGER — load BEFORE acting, not after —
-  whenever: you are about to run ANY script or command that calls a model or
-  drives a conversational/eval harness (probe, smoke test, simulation,
-  grader, persona conversation) outside a live Ringer run; you are about to
-  start an edit→test→edit loop or a batch of similar edits across files; you
-  are about to do a "quick check" that spawns a model or a CLI agent; you are
-  reviewing or diagnosing failed worker or model output; you catch yourself
-  thinking a task is "small enough to just do myself" — that thought IS the
-  trigger (a single task is a one-task manifest, and a bounded read-only
-  question is `ringer.py ask`); or you are writing or
-  reviewing a manifest, choosing a swarm pattern (review swarm, fix swarm,
-  focus group, bakeoff, research-with-proof), picking a worker engine, or
-  debugging a failed run. SKIP only for: reading or searching files, git
-  operations, a one-file few-line ONE-SHOT edit (once — if you are back for a
-  second pass, that is a loop: TRIGGER), authoring prose/specs/docs straight
-  from your own context, or pure conversation.
+  Orchestrate and review verified model work through the local Ringer tool.
+  Use before model-calling harnesses, manifests, swarms, bakeoffs, probes,
+  multi-file edit loops, or diagnosis of Ringer worker output. Skip for pure
+  file reading/searching, git operations, prose authored from current context,
+  conversation, or a one-file few-line one-shot edit.
 ---
 
 # Ringer orchestrator playbook
@@ -283,6 +271,14 @@ per task via the manifest `engine` field. Defaults are deliberate:
   trusting it with a batch.
 - Small/flash-class models are the first to choke on long conversational or
   multi-turn harness tasks — watch their retry counts before scaling them.
+  Give them an action-first brief: one primary objective, the owned files,
+  the exact first write, the check command, and the stop condition before
+  background explanation. Treat roughly 4,000 characters, three independent
+  behavior contracts, or three owned production files as a warning that the
+  lane should be split or moved to a stronger model. This is a judgment
+  threshold, not a lint rule. Use low reasoning from the first launch for a
+  mechanical copy/edit/test lane; do not discover that setting only after a
+  long stall.
 - Match `timeout_s` to the task: conversational harness tasks and
   build-and-test checks need far more than file edits.
 - **Check the evidence before assigning models to tasks.** Run
@@ -492,3 +488,8 @@ to a shepherd until the cause is understood.
 Stdin closed (`< /dev/null`); sandbox mode explicit; verification executes
 the artifact; logs carry raw worker output only. These are load-bearing —
 engine and invocation changes must keep all four.
+
+For reviewer fallbacks, compare `expect_files` with the actual `<workdir>/<task-key>/` layout before launch. A parent-directory expectation paired with a taskdir-relative checker can fail after a clean lint; fix the path and lint without spending another model attempt when the artifact is otherwise available.
+## Scoped operator overrides
+
+A direct user instruction that removes a load or other operational gate for a named run supersedes generic skill and collision-map thresholds for that run. Do not reinstate the removed gate in the remaining checks, worker brief, or status report; retain generic thresholds for other runs.
