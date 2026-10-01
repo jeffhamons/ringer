@@ -153,6 +153,10 @@ self-contained:
   "Your current working directory IS a git worktree of <repo> — edit files
   here directly." State what the worker must NEVER touch before what it
   should do.
+- **Confirm the worker's identity.** Say it has already been selected and is
+  running one assigned task; repository orchestration docs describe other
+  roles. It still follows repository safety and file-ownership rules. This
+  prevents a worker from waiting for a nonexistent model-selection decision.
 - **Name every file the worker owns.** In multi-worker runs over one repo,
   file ownership must be disjoint — and disjoint across *all* concurrent
   lanes/branches, not just within one batch. Every file a spec mentions must
