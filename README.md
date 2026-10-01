@@ -108,7 +108,7 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `timeout_s` | Per-task kill timer (default 900) — bounds the worker, not the check |
 | `check_timeout_s` | Per-task budget for the check command itself (default 300, `CHECK_TIMEOUT_S`) — raise this when a check runs a real build/test suite that legitimately takes longer, e.g. `"check_timeout_s": 900` |
 | `max_attempts` | How many times this task may run (default 2 — one try plus one retry with the check's failure output injected). Set `1` for a hard no-retry lane |
-| `redact_spec` | Replace this task's spec with `[redacted request packet]` in the run state, the logged command line, and the eval row, for specs carrying sensitive material. Redacts Ringer's own records only — captured worker output is never rewritten (invariant), so a worker that echoes its request still puts that text in `worker.log` |
+| `redact_spec` | Replace this task's spec with `[redacted request packet]` in the run state, the logged command line, and the eval row. Worker output is screened for recognizable credentials before display or logging; this does not hide arbitrary request text echoed by a worker. |
 | `engine_args` | Extra CLI flags for this task's worker, spliced in at the engine's `{engine_args}` placeholder — e.g. `["-c", "model_reasoning_effort=low"]` so the orchestrator picks reasoning depth per task |
 | `verified` | One plain-English sentence saying what the check proves — shown on the results page next to "finished & checked" |
 | `full_access` | Worker runs unsandboxed — required for workers that spawn their own sub-workers; must also be enabled in config |
