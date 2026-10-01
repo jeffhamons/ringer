@@ -235,7 +235,8 @@ class AskCommandTests(unittest.TestCase):
             worker.write_text(
                 "from pathlib import Path\n"
                 "Path('answer.md').write_text('Redacted answer.\\n', encoding='utf-8')\n"
-                "print('RAW WORKER OUTPUT MUST REMAIN')\n",
+                "print('RAW WORKER OUTPUT MUST REMAIN')\n"
+                "print('Authorization: Bearer re_FAKEaskworker123')\n",
                 encoding="utf-8",
             )
             config = self.write_config(root, worker)
@@ -271,6 +272,8 @@ class AskCommandTests(unittest.TestCase):
             self.assertIn("[redacted request packet]", state_text)
             self.assertIn("[redacted request packet]", eval_text)
             self.assertIn("RAW WORKER OUTPUT MUST REMAIN", worker_log)
+            self.assertNotIn("re_FAKEaskworker123", worker_log)
+            self.assertIn("Authorization: Bearer [REDACTED]", worker_log)
 
     def test_existing_answer_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_root:

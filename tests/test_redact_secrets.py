@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import sqlite3
 import subprocess
@@ -18,7 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "scrub-run-logs.py"
 sys.path.insert(0, str(ROOT))
 
-from ringer import TaskSpec, Verifier, redact_secrets, tail_file_text, tail_lines  # noqa: E402
+from ringer import (  # noqa: E402
+    RingerRunner,
+    RollingBytes,
+    TaskSpec,
+    Verifier,
+    redact_secrets,
+    tail_file_text,
+    tail_lines,
+)
 
 
 LONG_SPEC = (
@@ -198,6 +207,68 @@ class TailFunnelRedactionTests(unittest.TestCase):
         self.assertIn("[REDACTED]", text)
         self.assertIn("Bearer [REDACTED]", text)
         self.assertIn("worker finished", text)
+
+
+class WorkerStreamRedactionTests(unittest.TestCase):
+    class FakeStream:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.chunks = iter(chunks)
+
+        async def read(self, _size: int) -> bytes:
+            return next(self.chunks, b"")
+
+    class FakeStdout:
+        def __init__(self) -> None:
+            self.buffer = io.BytesIO()
+
+    def tee(self, chunks: list[bytes]) -> tuple[bytes, bytes, bytes]:
+        proc = mock.Mock()
+        proc.stdout = self.FakeStream(chunks)
+        log = io.BytesIO()
+        displayed = self.FakeStdout()
+        capture = RollingBytes(max_bytes=1_000_000)
+        runner = object.__new__(RingerRunner)
+        with mock.patch.object(sys, "stdout", displayed):
+            asyncio.run(runner._tee_stream(proc, log, capture))
+        return log.getvalue(), displayed.buffer.getvalue(), bytes(capture.data)
+
+    def test_split_bearer_is_redacted_from_log_and_display_but_kept_for_attribution(self) -> None:
+        token = b"re_FAKEsplitcredential123"
+        chunks = [
+            b"usage tokens: 321\nAuthorization: Bearer re_FAKEsplit",
+            b"credential123\nmodel: test-model\n",
+        ]
+
+        persisted, displayed, captured = self.tee(chunks)
+
+        for external in (persisted, displayed):
+            self.assertNotIn(token, external)
+            self.assertIn(b"Authorization: Bearer [REDACTED]", external)
+            self.assertIn(b"usage tokens: 321", external)
+            self.assertIn(b"model: test-model", external)
+        self.assertIn(token, captured, "raw bounded capture must remain available for attribution")
+
+    def test_clean_output_is_unchanged_across_read_chunks(self) -> None:
+        chunks = [b"ordinary clean", b" output\nsecond line", b" without newline"]
+        expected = b"".join(chunks)
+
+        persisted, displayed, captured = self.tee(chunks)
+
+        self.assertEqual(expected, persisted)
+        self.assertEqual(expected, displayed)
+        self.assertEqual(expected, captured)
+
+    def test_overlong_line_is_bounded_and_withheld(self) -> None:
+        secret = b"re_FAKEafterlongline123"
+        chunks = [b"x" * 70_000, secret + b"\nclean after\n"]
+
+        persisted, displayed, captured = self.tee(chunks)
+
+        for external in (persisted, displayed):
+            self.assertNotIn(secret, external)
+            self.assertIn(b"content withheld", external)
+            self.assertIn(b"clean after\n", external)
+        self.assertIn(secret, captured)
 
 
 class VerifierRedactionTests(unittest.TestCase):

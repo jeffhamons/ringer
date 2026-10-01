@@ -10328,18 +10328,29 @@ class RingerRunner:
     ) -> None:
         if proc.stdout is None:
             return
+        redactor = StreamingSecretRedactor()
         while True:
             chunk = await proc.stdout.read(4096)
             if not chunk:
+                for safe_chunk in redactor.finish():
+                    self._write_worker_output(log_fh, safe_chunk)
                 return
-            log_fh.write(chunk)
-            log_fh.flush()
+            # Attribution must see the worker's original output. Only the two
+            # external sinks (worker.log and the live terminal) receive the
+            # screened stream.
             capture.extend(chunk)
-            try:
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
-            except Exception:
-                pass
+            for safe_chunk in redactor.feed(chunk):
+                self._write_worker_output(log_fh, safe_chunk)
+
+    @staticmethod
+    def _write_worker_output(log_fh: Any, chunk: bytes) -> None:
+        log_fh.write(chunk)
+        log_fh.flush()
+        try:
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
 
     def _log_attempt(
         self,
@@ -10540,6 +10551,66 @@ class RollingBytes:
 
     def text(self) -> str:
         return bytes(self.data).decode("utf-8", errors="replace")
+
+
+class StreamingSecretRedactor:
+    """Redact complete worker-output lines without trusting read boundaries.
+
+    A credential may be divided between arbitrary ``read`` calls, so output is
+    held until a newline establishes a safe screening boundary. A worker can
+    also print an infinite line; cap that buffer and fail closed for only that
+    overlong line rather than allowing memory growth or leaking a partial
+    credential.
+    """
+
+    MAX_LINE_BYTES = 64 * 1024
+    _WITHHELD = (
+        b"[ringer.py] worker output line exceeded 65536 bytes; "
+        b"content withheld because it could not be safely screened\n"
+    )
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._dropping_overlong_line = False
+
+    @staticmethod
+    def _redact(data: bytes) -> bytes:
+        text = data.decode("utf-8", errors="replace")
+        return redact_secrets(text).encode("utf-8", errors="replace")
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        output: list[bytes] = []
+        remaining = chunk
+        while remaining:
+            if self._dropping_overlong_line:
+                newline = remaining.find(b"\n")
+                if newline < 0:
+                    return output
+                self._dropping_overlong_line = False
+                remaining = remaining[newline + 1 :]
+                continue
+
+            newline = remaining.find(b"\n")
+            take = remaining if newline < 0 else remaining[: newline + 1]
+            self._pending.extend(take)
+            remaining = b"" if newline < 0 else remaining[newline + 1 :]
+
+            if len(self._pending) > self.MAX_LINE_BYTES:
+                self._pending.clear()
+                output.append(self._WITHHELD)
+                if newline < 0:
+                    self._dropping_overlong_line = True
+            elif newline >= 0:
+                output.append(self._redact(bytes(self._pending)))
+                self._pending.clear()
+        return output
+
+    def finish(self) -> list[bytes]:
+        if self._dropping_overlong_line or not self._pending:
+            return []
+        output = [self._redact(bytes(self._pending))]
+        self._pending.clear()
+        return output
 
 
 class AsyncFileCloser:
