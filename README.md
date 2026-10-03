@@ -388,6 +388,8 @@ The scoreboard keeps the trained model, its lab, the invoking harness, the acces
 
 Every task attempt is logged **automatically and locally** to `~/.ringer/runs.jsonl` — no setup, no account, nothing leaves your machine. Each row carries the per-attempt verdict straight from the EXECUTED check, plus duration, tokens, the resolved `model`, the task's `task_type` (if the manifest set one), and the `retry` number.
 
+Run state and local attempt rows also retain `worker_returncode`, `worker_timed_out`, and `worker_terminal_status` separately from `check_returncode` and `check_timed_out`. For the `grok` engine with JSON output enabled, a top-level CLI result records `COMPLETE` or `ERROR`, a safe error subtype, and the reported turn count. Other output stays `UNKNOWN`; exit code zero alone does not establish CLI completion. A valid artifact can still receive check `PASS` when the worker reports a terminal error such as `error_max_turns`. That observation does not trigger an additional retry or change artifact harvesting.
+
 Read it with:
 
 ```bash

@@ -375,6 +375,12 @@ class EstimateUsesEveryStepTests(unittest.TestCase):
         tmp.write_text("no json here\n", encoding="utf-8")
         self.assertEqual(ringer.parse_step_tokens(tmp), 0)
 
+    def test_nonfinite_negative_boolean_and_nonnumeric_tokens_are_ignored(self):
+        for invalid in (float("nan"), float("inf"), -float("inf"), -99, True, "100", None):
+            with self.subTest(invalid=invalid):
+                log = self._log([(invalid, 7), (13, invalid), (0, 3.9)])
+                self.assertEqual(23, ringer.parse_step_tokens(log))
+
 
 class PriceValidationTests(unittest.TestCase):
     """A price is input too, and feeds the same enforcement path as the budget."""
