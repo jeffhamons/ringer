@@ -41,6 +41,93 @@ class RedactSecretsUnitTests(unittest.TestCase):
         text = "build succeeded: 12 tests passed, 0 failed, took 3.2s"
         self.assertEqual(text, redact_secrets(text))
 
+    def test_json_event_nested_string_assignments_preserve_structure(self) -> None:
+        for key in ("password", "token", "api_key"):
+            for value in ('FAKEunprefixedCredential123456', 'FAKEquote\\path"suffix'):
+                with self.subTest(key=key, value=value):
+                    payload = {"type": "text", "part": {"text": f'{key} = {json.dumps(value)}'},
+                               "token": 123, "metadata": {"count": 17}}
+                    text = json.dumps(payload)
+                    result = redact_secrets(text)
+                    parsed = json.loads(result)
+                    self.assertNotIn("FAKE", result)
+                    self.assertEqual(123, parsed["token"])
+                    self.assertEqual({"count": 17}, parsed["metadata"])
+                    self.assertEqual(f'{key} = "[REDACTED]"', parsed["part"]["text"])
+                    self.assertEqual(result, redact_secrets(result))
+
+    def test_json_string_containing_json_assignment_is_redacted(self) -> None:
+        payload = {"text": json.dumps({"payload": {"password": 'FAKEnested\\"credential'}})}
+        result = redact_secrets(json.dumps(payload))
+        parsed = json.loads(json.loads(result)["text"])
+        self.assertEqual("[REDACTED]", parsed["payload"]["password"])
+
+    def test_top_level_json_string_assignment_preserves_valid_json(self) -> None:
+        text = json.dumps('password="FAKEscalarcredential"') + "\n"
+        result = redact_secrets(text)
+        self.assertNotIn("FAKE", result)
+        self.assertEqual('password="[REDACTED]"', json.loads(result))
+        self.assertTrue(result.endswith("\n"))
+        self.assertEqual(result, redact_secrets(result))
+
+    def test_plain_assignment_containing_json_redacts_the_entire_value(self) -> None:
+        text = "password = '{\"opaque\": \"FAKEjsoncredential\"}' end"
+        self.assertEqual("password = '[REDACTED]' end", redact_secrets(text))
+
+    def test_benign_json_is_byte_identical_including_numeric_token(self) -> None:
+        text = '{ "type" : "step_finish", "token": 42, "part": {"tokens": {"input": 123}} }\n'
+        self.assertEqual(text, redact_secrets(text))
+
+    def test_structured_nonstring_credentials_are_redacted_except_numeric_token(self) -> None:
+        payload = {"password": 8675309, "api_key": 123456789,
+                   "client_secret": 8675309, "access_key": 123456789,
+                   "token": [123456789, "FAKElistcredential"],
+                   "metadata": {"token": 321, "count": 17}}
+        result = redact_secrets(json.dumps(payload))
+        parsed = json.loads(result)
+        for key in ("password", "api_key", "client_secret", "access_key", "token"):
+            self.assertEqual("[REDACTED]", parsed[key])
+        self.assertNotIn("8675309", result)
+        self.assertNotIn("123456789", result)
+        self.assertNotIn("FAKElistcredential", result)
+        self.assertEqual({"token": 321, "count": 17}, parsed["metadata"])
+        self.assertEqual(result, redact_secrets(result))
+
+    def test_null_credentials_and_numeric_token_remain_but_bool_and_objects_redact(self) -> None:
+        payload = {"password": None, "api_key": {"opaque": "FAKEobjectcredential"},
+                   "token": True, "telemetry": {"token": 321.5}}
+        parsed = json.loads(redact_secrets(json.dumps(payload)))
+        self.assertIsNone(parsed["password"])
+        self.assertEqual("[REDACTED]", parsed["api_key"])
+        self.assertEqual("[REDACTED]", parsed["token"])
+        self.assertEqual({"token": 321.5}, parsed["telemetry"])
+
+    def test_jsonl_and_mixed_tail_keep_parseable_events(self) -> None:
+        event = json.dumps({"text": 'api_key = "FAKEmixedcredential"', "token": 42})
+        benign = '{ "token" : 99, "type" : "result" }'
+        result = redact_secrets("starting\n" + event + "\n" + benign + "\nfinished\n")
+        lines = result.splitlines()
+        self.assertEqual("starting", lines[0])
+        self.assertNotIn("FAKE", result)
+        self.assertEqual(42, json.loads(lines[1])["token"])
+        self.assertEqual(benign, lines[2])
+        self.assertEqual("finished", lines[3])
+
+    def test_prefixed_json_fragment_keeps_numeric_fields_and_escaping(self) -> None:
+        event = json.dumps({"text": 'password = "FAKEprefixcredential"', "token": 42})
+        result = redact_secrets("event: " + event + " end")
+        self.assertNotIn("FAKE", result)
+        parsed = json.loads(result[len("event: "):-len(" end")])
+        self.assertEqual(42, parsed["token"])
+        self.assertEqual('password = "[REDACTED]"', parsed["text"])
+        self.assertEqual(result, redact_secrets(result))
+        benign = 'event: { "token" : 42, "count" : 7 } end'
+        self.assertEqual(benign, redact_secrets(benign))
+
+    def test_plain_quoted_assignment_with_escaped_quote_redacts_whole_value(self) -> None:
+        result = redact_secrets('password = "FAKEfirst\\"FAKEsecond\\\\tail" end')
+        self.assertEqual('password = "[REDACTED]" end', result)
+
     def test_empty_and_none_do_not_raise(self) -> None:
         self.assertEqual("", redact_secrets(""))
         self.assertEqual("", redact_secrets(None))  # type: ignore[arg-type]
@@ -180,6 +267,13 @@ class RedactSecretsUnitTests(unittest.TestCase):
         self.assertIn("redaction failed", result)
         self.assertIn("RuntimeError", result)
 
+    def test_failure_message_does_not_echo_exception_secret(self) -> None:
+        import ringer
+        with mock.patch.object(ringer, "_redact_structured_text", side_effect=ValueError("FAKEprivate exception")):
+            result = redact_secrets('password="FAKEprivate credential"')
+        self.assertNotIn("FAKEprivate", result)
+        self.assertIn("withheld", result)
+
 
 class TailFunnelRedactionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -257,6 +351,16 @@ class WorkerStreamRedactionTests(unittest.TestCase):
         self.assertEqual(expected, persisted)
         self.assertEqual(expected, displayed)
         self.assertEqual(expected, captured)
+
+    def test_split_json_assignment_remains_parseable_in_both_sinks(self) -> None:
+        line = json.dumps({"text": 'password = "FAKEsplitcredential123"', "token": 321}).encode() + b"\n"
+        split = line.index(b"credential")
+        persisted, displayed, captured = self.tee([line[:split], line[split:]])
+        for external in (persisted, displayed):
+            self.assertNotIn(b"FAKEsplitcredential123", external)
+            self.assertEqual(321, json.loads(external)["token"])
+            self.assertIn("[REDACTED]", json.loads(external)["text"])
+        self.assertEqual(line, captured)
 
     def test_overlong_line_is_bounded_and_withheld(self) -> None:
         secret = b"re_FAKEafterlongline123"

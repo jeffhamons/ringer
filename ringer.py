@@ -2424,6 +2424,13 @@ class TaskRuntime:
     last_check_returncode: int | None = None
     last_check_timed_out: bool = False
     last_check_output: str = ""
+    # Worker transport/protocol observations are separate from the artifact
+    # check verdict. A checked artifact can pass after a CLI terminal error.
+    last_worker_returncode: int | None = None
+    last_worker_timed_out: bool = False
+    last_worker_terminal_status: str = "UNKNOWN"
+    last_worker_terminal_subtype: str | None = None
+    last_worker_terminal_num_turns: int | None = None
     # Why task setup failed before any worker could spawn (e.g. a stale
     # worktree from a previous failed run). Without this an ERROR verdict at
     # 0.0s carries no diagnostics anywhere the operator looks.
@@ -2446,6 +2453,9 @@ class WorkerResult:
     error: str | None = None
     reported_model: str | None = None
     engine_down_reason: str | None = None
+    terminal_status: str = "UNKNOWN"
+    terminal_subtype: str | None = None
+    terminal_num_turns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -2633,6 +2643,11 @@ class StateWriter:
                     "check_returncode": runtime.last_check_returncode,
                     "check_timed_out": runtime.last_check_timed_out,
                     "check_output_tail": shorten(runtime.last_check_output, 4000),
+                    "worker_returncode": runtime.last_worker_returncode,
+                    "worker_timed_out": runtime.last_worker_timed_out,
+                    "worker_terminal_status": runtime.last_worker_terminal_status,
+                    "worker_terminal_subtype": runtime.last_worker_terminal_subtype,
+                    "worker_terminal_num_turns": runtime.last_worker_terminal_num_turns,
                     "setup_error": redact_secrets(runtime.setup_error) if runtime.setup_error else None,
                     "timeout_s": runtime.task.timeout_s,
                     "max_attempts": runtime.task.max_attempts,
@@ -9443,8 +9458,8 @@ _GENERIC_KEY_RE = re.compile(
     (?P<q1>['"]?)
     (?P<sep>\s*(?:=>|=|:)\s*)
     (?:
-        "(?P<dval>[^"]*)"
-      | '(?P<sval>[^']*)'
+        "(?P<dval>(?:\\.|[^"\\])*)"
+      | '(?P<sval>(?:\\.|[^'\\])*)'
       | (?P<uval>[^\s,}'"]+)
     )
     """
@@ -9466,6 +9481,108 @@ def _redact_generic_key(match: re.Match[str]) -> str:
     return f"{key}{q1}{sep}{_REDACTED}"
 
 
+_CREDENTIAL_KEY_RE = re.compile(
+    r"(?:api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|token|secret|password|passwd)",
+    re.IGNORECASE,
+)
+
+
+def _redact_plain_text(text: str) -> str:
+    redacted = _BEARER_RE.sub(_redact_bearer, text)
+    for prefix_re, prefix in _PREFIX_RES:
+        redacted = prefix_re.sub(prefix + _REDACTED, redacted)
+    redacted = _AKIA_RE.sub("AKIA" + _REDACTED, redacted)
+    return _GENERIC_KEY_RE.sub(_redact_generic_key, redacted)
+
+
+def _redact_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (_REDACTED if item is not None and _CREDENTIAL_KEY_RE.fullmatch(key)
+                  and not (key.lower() == "token" and isinstance(item, (int, float))
+                           and not isinstance(item, bool))
+                  else _redact_json_value(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_structured_text(value)
+    return value
+
+
+def _redact_embedded_json(text: str) -> str:
+    """Screen complete JSON fragments in prefixed diagnostics as decoded data."""
+    decoder = json.JSONDecoder()
+    output: list[str] = []
+    fragments: dict[str, str] = {}
+    marker = "\x00ringer-json-"
+    while marker in text:
+        marker += "-"
+    end = 0
+    for match in re.finditer(r"[\[{]", text):
+        start = match.start()
+        if start < end:
+            continue
+        try:
+            value, next_end = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if not isinstance(value, (dict, list)):
+            continue
+        output.append(text[end:start])
+        original = text[start:next_end]
+        screened = _redact_json_value(value)
+        placeholder = f"{marker}{len(fragments)}\x00"
+        fragments[placeholder] = original if screened == value else json.dumps(screened, ensure_ascii=False)
+        output.append(placeholder)
+        end = next_end
+    output.append(text[end:])
+    # Screen surrounding assignments as one span too: password='JSON' must
+    # redact the whole credential value rather than restore its JSON payload.
+    result = _redact_plain_text("".join(output))
+    for placeholder, fragment in fragments.items():
+        result = result.replace(placeholder, fragment)
+    return result
+
+
+def _redact_structured_text(text: str) -> str:
+    # JSON string escaping is a transport layer, not part of the credential.
+    # Screen decoded strings, then encode them again to preserve valid events.
+    # Leave benign JSON byte-for-byte intact (including numeric token fields).
+    try:
+        value = json.loads(text)
+    except ValueError:
+        # Tail/check excerpts can contain several JSONL events mixed with
+        # ordinary diagnostics. Screen each complete event as structured data;
+        # keep adjacent plain text together for multiline assignment matching.
+        lines = text.splitlines(keepends=True)
+        if len(lines) > 1:
+            output: list[str] = []
+            plain: list[str] = []
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    item = None
+                if isinstance(item, (dict, list)):
+                    output.append(_redact_embedded_json("".join(plain)))
+                    plain.clear()
+                    output.append(_redact_structured_text(line))
+                else:
+                    plain.append(line)
+            output.append(_redact_embedded_json("".join(plain)))
+            return "".join(output)
+        return _redact_embedded_json(text)
+    if not isinstance(value, (dict, list, str)):
+        return _redact_plain_text(text)
+    screened = _redact_json_value(value)
+    if screened == value:
+        return text
+    ending = "\r\n" if text.endswith("\r\n") else "\n" if text.endswith("\n") else ""
+    return json.dumps(screened, ensure_ascii=False) + ending
+
+
 def redact_secrets(text: str) -> str:
     """Replace credential values with [REDACTED], keeping surrounding text,
     key names and structure intact so the result stays diagnostic.
@@ -9479,15 +9596,10 @@ def redact_secrets(text: str) -> str:
     if not text:
         return "" if text is None else text
     try:
-        redacted = _BEARER_RE.sub(_redact_bearer, text)
-        for prefix_re, prefix in _PREFIX_RES:
-            redacted = prefix_re.sub(prefix + _REDACTED, redacted)
-        redacted = _AKIA_RE.sub("AKIA" + _REDACTED, redacted)
-        redacted = _GENERIC_KEY_RE.sub(_redact_generic_key, redacted)
-        return redacted
+        return _redact_structured_text(text)
     except Exception as exc:
         return (
-            f"[ringer] redaction failed ({type(exc).__name__}: {exc}); "
+            f"[ringer] redaction failed ({type(exc).__name__}); "
             f"{len(text)} characters withheld because they could not be "
             "screened for credentials."
         )
@@ -9551,19 +9663,52 @@ class Verifier:
         )
         timed_out = False
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            timed_out = True
-            terminate_process_group(proc)
             try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
-                kill_process_group(proc)
-                stdout, _ = await proc.communicate()
+                timed_out = True
+                terminate_process_group(proc)
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                except asyncio.TimeoutError:
+                    kill_process_group(proc)
+                    stdout, _ = await proc.communicate()
+        except asyncio.CancelledError as cancelled:
+            # Runner shutdown tracks workers, but checks have their own session.
+            # Retain a shielded cleanup task so repeated cancellation cannot
+            # strand either the checker or descendants holding its output pipe.
+            cleanup = asyncio.create_task(Verifier._stop_check(proc))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            # Cleanup failure must not turn a requested cancellation into an
+            # ordinary task failure (or accidentally continue verification).
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                cleanup.result()
+            raise cancelled
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
             output += f"\n[ringer.py] check timed out after {timeout}s\n"
         return proc.returncode, timed_out, output
+
+    @staticmethod
+    async def _stop_check(proc: asyncio.subprocess.Process) -> None:
+        terminate_process_group(proc)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            kill_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                # A descendant can escape the session while retaining a pipe.
+                # Stop waiting on that pipe, close the subprocess transport,
+                # and bound reaping of the checker itself too. asyncio exposes
+                # no public Process.close() for the pipe transport.
+                proc._transport.close()
+                await asyncio.wait_for(proc.wait(), timeout=5)
 
 
 class RingerRunner:
@@ -9689,14 +9834,7 @@ class RingerRunner:
 
     async def kill_all_workers(self) -> None:
         procs = list(self.active_processes.values())
-        for proc in procs:
-            if proc.returncode is None:
-                terminate_process_group(proc)
-        if procs:
-            await asyncio.sleep(1)
-        for proc in procs:
-            if proc.returncode is None:
-                kill_process_group(proc)
+        await asyncio.gather(*(stop_worker_process_tree(proc, grace_s=1) for proc in procs))
 
     def _engine_down_reason(self, engine_name: str) -> str | None:
         with self.lock:
@@ -9929,8 +10067,17 @@ class RingerRunner:
                 with self.lock:
                     runtime.worker_pid = None
                     runtime.status = "verifying"
+                    runtime.last_worker_returncode = worker.returncode
+                    runtime.last_worker_timed_out = worker.timed_out
+                    runtime.last_worker_terminal_status = worker.terminal_status
+                    runtime.last_worker_terminal_subtype = worker.terminal_subtype
+                    runtime.last_worker_terminal_num_turns = worker.terminal_num_turns
                     if worker.tokens is not None:
                         runtime.tokens = (runtime.tokens or 0) + worker.tokens
+                # Earlier steps can have billed usage even when the final CLI
+                # response reports an engine-wide failure. Preserve that spend
+                # before the fast-fail branch makes this runtime terminal.
+                self._refresh_cost(runtime)
                 if worker.engine_down_reason is not None:
                     reason = self._mark_engine_down(runtime.task.engine, worker.engine_down_reason)
                     duration_ms = int((time.monotonic() - attempt_started) * 1000)
@@ -9940,7 +10087,6 @@ class RingerRunner:
                     return
                 # Money is counted the moment the worker stops, before the check
                 # runs, so a budget cannot be overshot by a slow verification.
-                self._refresh_cost(runtime)
                 await self._check_budget()
                 verify = await self.verifier.verify(runtime.task, runtime.taskdir)
                 verdict = verdict_for(worker, verify)
@@ -10297,12 +10443,7 @@ class RingerRunner:
                 await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
             except asyncio.TimeoutError:
                 timed_out = True
-                terminate_process_group(proc)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    kill_process_group(proc)
-                    await proc.wait()
+                await stop_worker_process_tree(proc, grace_s=5)
             try:
                 await asyncio.wait_for(reader, timeout=5)
             except asyncio.TimeoutError:
@@ -10311,6 +10452,9 @@ class RingerRunner:
                     await reader
             self.active_processes.pop(proc.pid, None)
         output_tail = capture.text()
+        terminal_status, terminal_subtype, terminal_num_turns = parse_worker_terminal_state(
+            output_tail, engine, cmd
+        )
         tokens = parse_token_count(output_tail, engine.token_regex)
         reported_model = parse_reported_model(output_tail, engine.model_report_regex)
         engine_down_reason = (
@@ -10337,6 +10481,9 @@ class RingerRunner:
             tokens=tokens,
             reported_model=reported_model,
             engine_down_reason=engine_down_reason,
+            terminal_status=terminal_status,
+            terminal_subtype=terminal_subtype,
+            terminal_num_turns=terminal_num_turns,
         )
 
     async def _tee_stream(
@@ -10452,6 +10599,13 @@ class RingerRunner:
                 "verdict": verdict,
                 "duration_ms": duration_ms,
                 "worker_tokens": worker.tokens,
+                "worker_returncode": worker.returncode,
+                "worker_timed_out": worker.timed_out,
+                "worker_terminal_status": worker.terminal_status,
+                "worker_terminal_subtype": worker.terminal_subtype,
+                "worker_terminal_num_turns": worker.terminal_num_turns,
+                "check_returncode": verify.check_returncode,
+                "check_timed_out": verify.check_timed_out,
                 "notes": "\n".join(notes_parts),
                 "orchestrator": self.identity,
                 "model": stamped_model,
@@ -10815,6 +10969,64 @@ def estimate_cost_from_tokens(engine: "EngineConfig", tokens: int) -> float | No
     return scaled * float(rate) / 1_000_000
 
 
+def parse_worker_terminal_state(
+    text: str, engine: EngineConfig, command: list[str]
+) -> tuple[str, str | None, int | None]:
+    """Fixed Grok CLI result evidence, independent of the executed check.
+
+    This is a CLI protocol parser, not an OpenRouter SSE/API parser. Require
+    the recognized engine and a resolved JSON output flag before considering
+    top-level result frames. Never inspect nested tool results or free text.
+    Unknown error labels collapse to a fixed value rather than persisting
+    worker-controlled messages. Absence of evidence remains UNKNOWN.
+    """
+    unknown = ("UNKNOWN", None, None)
+    if engine.name != "grok":
+        return unknown
+    # Prompt text is not a CLI option, even if it happens to name a flag.
+    options = command[1:]
+    for index, item in enumerate(options):
+        if item in {"-p", "--prompt", "--"}:
+            options = options[:index]
+            break
+    output_format = None
+    for index, item in enumerate(options):
+        if item == "--output-format" and index + 1 < len(options):
+            output_format = options[index + 1]
+        elif item.startswith("--output-format="):
+            output_format = item.split("=", 1)[1]
+    if output_format not in {"json", "stream-json", "streaming-messages-json"}:
+        return unknown
+    try:
+        events = [json.loads(text)]
+    except ValueError:
+        events = []
+        for line in text.splitlines():
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+    result = unknown
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "result":
+            continue
+        is_error = event.get("is_error")
+        if not isinstance(is_error, bool):
+            continue
+        subtype = event.get("subtype")
+        if is_error:
+            status = "ERROR"
+            safe_subtype = "error_max_turns" if subtype == "error_max_turns" else "OTHER_ERROR"
+        elif subtype == "success":
+            status, safe_subtype = "COMPLETE", None
+        else:
+            continue
+        turns = event.get("num_turns")
+        safe_turns = turns if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0 else None
+        result = (status, safe_subtype, safe_turns)
+    return result
+
+
 def parse_step_tokens(log_path: Path) -> int:
     """Total tokens across every step in a worker log.
 
@@ -10850,7 +11062,8 @@ def parse_step_tokens(log_path: Path) -> int:
                 for field in ("input", "output"):
                     value = tokens.get(field)
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        total += int(value)
+                        if value >= 0 and (isinstance(value, int) or math.isfinite(value)):
+                            total += int(value)
     return total
 
 
@@ -11483,6 +11696,70 @@ def append_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(text)
+
+
+def owned_worker_process_groups(proc: asyncio.subprocess.Process) -> dict[int, dict[int, str]]:
+    """Capture descendants before a wrapper exits and reparents its servers.
+
+    Only groups whose leader is in this worker's tree are eligible. Keep member
+    identities for a later signal check, so a disappeared/reused group ID cannot
+    turn cleanup into a signal to unrelated work. Commands stay in memory.
+    """
+    children, commands = ProcessTree.read()
+    owned: set[int] = set()
+    pending = [proc.pid]
+    while pending:
+        pid = pending.pop()
+        if pid in owned:
+            continue
+        owned.add(pid)
+        pending.extend(children.get(pid, []))
+    groups: dict[int, dict[int, str]] = {}
+    orchestrator_group = os.getpgrp()
+    for pid in owned:
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        if pgid in owned and pgid != orchestrator_group and commands.get(pid):
+            groups.setdefault(pgid, {})[pid] = commands[pid]
+    return groups
+
+
+def signal_owned_worker_groups(groups: dict[int, dict[int, str]], signum: int) -> None:
+    _, commands = ProcessTree.read()
+    for pgid, members in groups.items():
+        if pgid == os.getpgrp():
+            continue
+        for pid, expected_command in members.items():
+            try:
+                if commands.get(pid) == expected_command and os.getpgid(pid) == pgid:
+                    os.killpg(pgid, signum)
+                    break
+            except ProcessLookupError:
+                continue
+
+
+async def stop_worker_process_tree(proc: asyncio.subprocess.Process, grace_s: float) -> None:
+    groups = owned_worker_process_groups(proc)
+    signal_owned_worker_groups(groups, signal.SIGTERM)
+    if proc.returncode is None and proc.pid not in groups:
+        terminate_process_group(proc)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace_s)
+    except asyncio.TimeoutError:
+        pass
+    # A wrapper exiting does not prove a separate-session server exited. Signal
+    # surviving captured groups even when the direct worker has already stopped.
+    signal_owned_worker_groups(groups, signal.SIGKILL)
+    if proc.returncode is None:
+        kill_process_group(proc)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        # An escaped process retaining stdout must not make cleanup unbounded.
+        proc._transport.close()
+        await asyncio.wait_for(proc.wait(), timeout=5)
 
 
 def terminate_process_group(proc: asyncio.subprocess.Process) -> None:
