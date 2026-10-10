@@ -24,9 +24,9 @@ PROVIDER_RE = re.compile(
     re.IGNORECASE,
 )
 HARNESS_RE = re.compile(
-    r"\b(?:node|python3?|bun|deno)\s+\S*"
-    r"(?:simulat|probe|smoke|harness|persona|grader|eval)\S*"
-    r"\.(?:mjs|js|ts|py)\b",
+    r"\b(?:node|python3?|bun|deno)\s+(?:\S*/)?[^\s/]*"
+    r"(?:simulat|probe|smoke|harness|persona|grader|eval)[^\s/]*"
+    r"\.(?:mjs|js|ts|py)(?=[\"']?(?:\s|[;|&<>)]|$))",
     re.IGNORECASE,
 )
 

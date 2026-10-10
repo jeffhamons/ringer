@@ -104,6 +104,39 @@ class NudgeHookTests(unittest.TestCase):
         proc = self.run_hook("pre-bash", payload)
         self.assertNudged(proc, "PreToolUse")
 
+    def test_pre_bash_ignores_harness_words_in_parent_directories(self) -> None:
+        for index, command in enumerate([
+            "python3 /tmp/codex-harness-audit/audit_parser.py",
+            "python ./eval/smoke/reports/audit_parser.py",
+            "node /tmp/persona-grader/parse.js",
+            'python3 "/tmp/codex-harness-audit/audit_parser.py"',
+            "bun /tmp/probe-simulate/parse.ts",
+            "python3 /tmp/model_harness.py/audit_parser.py",
+            "node ./probe.js/reports/parse.js",
+            "python3 /tmp/eval.py.archive/audit_parser.py",
+            'python3 "/tmp/model_harness.py"/audit_parser.py',
+        ]):
+            with self.subTest(command=command):
+                self.assertSilent(self.run_hook("pre-bash", self.pre_bash_payload(command, f"audit-{index}")))
+
+    def test_pre_bash_keeps_harness_basename_detection(self) -> None:
+        for index, command in enumerate([
+            "python3 /tmp/ordinary/model_harness.py",
+            "node ./ordinary/probe-simulate.mjs",
+            'python3 "/tmp/ordinary/eval.py"',
+            "bun /tmp/ordinary/grader.ts",
+            "deno ./ordinary/persona.js",
+            "python3 ./ordinary/model_harness.py --fixture synthetic",
+            "node ./ordinary/probe.js; echo completed",
+            "python3 './ordinary/eval.py'",
+        ]):
+            with self.subTest(command=command):
+                self.assertNudged(self.run_hook("pre-bash", self.pre_bash_payload(command, f"harness-{index}")), "PreToolUse")
+
+    def test_pre_bash_keeps_provider_detection_for_benign_basename(self) -> None:
+        command = "python3 /tmp/codex-harness-audit/audit_parser.py https://api.openai.com/v1/chat/completions"
+        self.assertNudged(self.run_hook("pre-bash", self.pre_bash_payload(command)), "PreToolUse")
+
     def test_pre_bash_stays_silent_on_ordinary_command(self) -> None:
         proc = self.run_hook("pre-bash", self.pre_bash_payload("ls -la"))
         self.assertSilent(proc)
