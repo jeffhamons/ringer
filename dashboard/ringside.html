@@ -258,5 +258,12 @@ Loading log…</pre
     </dialog>
     <script src="/hud.js"></script>
     <script src="/ringside.js"></script>
+    <script>
+      function pingViewer() {
+        fetch('/api/viewer-ping', {cache: 'no-store'}).catch(() => {});
+      }
+      pingViewer();
+      setInterval(pingViewer, 5000);
+    </script>
   </body>
 </html>

@@ -348,6 +348,8 @@ Ringside is a local web page — no install, no account, nothing leaves your mac
 ./ringer.py hud                 # or open it any time → http://127.0.0.1:8700
 ```
 
+`./ringer.py hud` reuses an open Ringside tab when it has pinged the server within the last 15 seconds. Use `./ringer.py hud --force-open` to open a new tab anyway, or set `reuse_open_tab = false` under `[hud]` in your config to always open one.
+
 **Live runs** shows every swarm, its progress, and a searchable task table. Select a task to inspect its brief, model, harness, attempts, last executed check and raw worker log. A failed check stays visible while its task retries; stopped workers are marked explicitly. **Outputs** keeps each run's result and saved versions together, with a live preview and access to its folder. **Models** shows first-try pass rates alongside task/attempt counts, task-type filtering and a low-sample warning. Expand all signals for the full scoreboard and judgment notes. Compact view keeps live runs and runs needing attention in a small window.
 
 Multiple swarms at once is the designed-for case: run three batches under three identities and Ringside shows all three, live. `--browser` opens a simpler per-run fallback dashboard, and `--no-dashboard` runs headless.

@@ -1113,6 +1113,7 @@ class AppConfig:
     # Which task types must name a ticket. Estate-specific by nature; see
     # DEFAULT_TICKETED_TASK_TYPES.
     ticketed_task_types: frozenset[str] = DEFAULT_TICKETED_TASK_TYPES
+    reuse_open_tab: bool = True
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1133,6 +1134,7 @@ class AppConfig:
         if dashboard_port_base <= 0:
             raise ValueError("dashboard_port_base must be positive")
         hud_port = load_hud_port(data.get("hud"))
+        reuse_open_tab = bool((data.get("hud") or {}).get("reuse_open_tab", True))
         identity_default = optional_string(data.get("identity_default"))
         hud_app_path = optional_path(data.get("hud_app_path"))
         allow_full_access = bool(data.get("allow_full_access", False))
@@ -1166,6 +1168,7 @@ class AppConfig:
             state_dir=state_dir,
             dashboard_port_base=dashboard_port_base,
             hud_port=hud_port,
+            reuse_open_tab=reuse_open_tab,
             hud_app_path=hud_app_path,
             allow_full_access=allow_full_access,
             eval=eval_config,
@@ -5871,6 +5874,7 @@ class PersistentHudServer:
         self.model_db_path: Path | None = None
         self.model_notes_path: Path | None = None
         self.update_status: dict[str, Any] | None = None
+        self.last_viewer_ping: float | None = None
 
     def start(self) -> int:
         state_dir = self.state_dir
@@ -5881,6 +5885,18 @@ class PersistentHudServer:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 path = urllib.parse.urlparse(self.path).path
+                if path == "/api/viewer-ping":
+                    server_ref.last_viewer_ping = time.monotonic()
+                    self.send_response(HTTPStatus.NO_CONTENT)
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
+                if path == "/api/viewer-status":
+                    last_ping = server_ref.last_viewer_ping
+                    send_json_response(self, {
+                        "seconds_since_viewer": None if last_ping is None else time.monotonic() - last_ping,
+                    })
+                    return
                 if path == "/":
                     body = read_ringside_html().encode("utf-8")
                     send_response_body(
@@ -12516,6 +12532,25 @@ def start_hud_update_maintenance(
         return None
 
 
+def hud_viewer_seconds_since_ping(port: int) -> float | None:
+    """Read the viewer heartbeat, allowing older HUDs to fail the lookup."""
+    url = f"http://127.0.0.1:{port}/api/viewer-status"
+    with urllib.request.urlopen(url, timeout=1) as response:
+        value = json.load(response).get("seconds_since_viewer")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def hud_has_recent_viewer(port: int) -> bool:
+    """A missing or failed heartbeat lookup should still allow a browser open."""
+    try:
+        seconds = hud_viewer_seconds_since_ping(port)
+        return seconds is not None and 0 <= seconds < 15
+    except Exception:
+        return False
+
+
 def ensure_hud_running(config: AppConfig, *, open_browser: bool) -> None:
     """Make sure the persistent Ringside page is up before a run starts.
 
@@ -12542,14 +12577,23 @@ def ensure_hud_running(config: AppConfig, *, open_browser: bool) -> None:
                 break
             time.sleep(0.15)
     if open_browser and not already_alive and hud_is_alive(port):
-        open_in_browser(url)
+        if not (config.reuse_open_tab and hud_has_recent_viewer(port)):
+            open_in_browser(url)
     print(f"Ringside: {url}", flush=True)
 
 
-def run_persistent_hud(config: AppConfig, *, port: int | None, open_viewer: bool) -> int:
+def run_persistent_hud(
+    config: AppConfig, *, port: int | None, open_viewer: bool, force_open: bool = False,
+) -> int:
     chosen_port = port if port is not None else config.hud_port
     if hud_is_alive(chosen_port):
         url = f"http://127.0.0.1:{chosen_port}"
+        if open_viewer and not force_open and config.reuse_open_tab and hud_has_recent_viewer(chosen_port):
+            print(
+                f"Ringside is already open in a browser tab: {url} "
+                "(not opening another; use --force-open to open one anyway)"
+            )
+            return 0
         print(f"Ringside is already running: {url}")
         if open_viewer:
             open_in_browser(url)
@@ -12749,6 +12793,7 @@ def build_parser() -> argparse.ArgumentParser:
     hud_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     hud_parser.add_argument("--port", type=int, help=f"port to bind on 127.0.0.1 (default: {DEFAULT_HUD_PORT})")
     hud_parser.add_argument("--no-open", action="store_true", help="start the server without opening a browser")
+    hud_parser.add_argument("--force-open", action="store_true", help="open a new browser tab even if Ringside is already open")
 
     db_parser = subparsers.add_parser("db", help="manage the derived SQLite read model")
     db_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -12882,6 +12927,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 port=args.port,
                 open_viewer=not args.no_open,
+                force_open=args.force_open,
             )
         if args.command == "ask":
             if args.timeout_s <= 0:
