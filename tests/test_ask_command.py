@@ -97,6 +97,7 @@ class AskCommandTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, cli_env(home), clear=True),
             mock.patch.object(ringer.Dashboard, "start", return_value=8787),
+            mock.patch.object(ringer, "ensure_hud_running"),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):

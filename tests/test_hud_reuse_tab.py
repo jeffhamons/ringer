@@ -35,7 +35,7 @@ class HudReuseTabTests(unittest.TestCase):
         self.root = Path(temp.name)
         self.config = hud_config(self.root)
         self.output = io.StringIO()
-        for name, value in (("hud_is_alive", True), ("hud_is_healthy", True)):
+        for name, value in (("hud_is_healthy", True),):
             if not hasattr(ringer, name):  # hud_is_healthy exists only on newer checkouts
                 continue
             patcher = mock.patch.object(ringer, name, return_value=value)
@@ -49,6 +49,7 @@ class HudReuseTabTests(unittest.TestCase):
         self.addCleanup(opener.stop)
         popen = mock.patch.object(ringer.subprocess, "Popen")
         self.popen = popen.start()
+        self.popen.return_value.poll.return_value = None
         self.addCleanup(popen.stop)
 
     def run_hud(self, *, force_open: bool = False, open_viewer: bool = True) -> None:
@@ -116,7 +117,7 @@ class HudReuseTabTests(unittest.TestCase):
         self.lookup.assert_not_called()
 
     def test_ensure_fresh_hud_reuses_recent_viewer(self) -> None:
-        with mock.patch.object(ringer, "hud_is_alive", side_effect=[False, True, True]):
+        with mock.patch.object(ringer, "hud_is_healthy", side_effect=[False, True, True]):
             with contextlib.redirect_stdout(self.output):
                 ringer.ensure_hud_running(self.config, open_browser=True)
         self.popen.assert_called_once()
@@ -125,7 +126,7 @@ class HudReuseTabTests(unittest.TestCase):
 
     def test_ensure_fresh_hud_lookup_failure_opens_once(self) -> None:
         self.lookup.side_effect = OSError("older HUD")
-        with mock.patch.object(ringer, "hud_is_alive", side_effect=[False, True, True]):
+        with mock.patch.object(ringer, "hud_is_healthy", side_effect=[False, True, True]):
             with contextlib.redirect_stdout(self.output):
                 ringer.ensure_hud_running(self.config, open_browser=True)
         self.popen.assert_called_once()

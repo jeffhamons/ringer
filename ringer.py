@@ -5885,6 +5885,11 @@ class PersistentHudServer:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 path = urllib.parse.urlparse(self.path).path
+                if path == "/api/identity":
+                    send_json_response(self, hud_identity(
+                        state_dir, server_ref.model_log_path or server_ref.default_model_log_path,
+                    ))
+                    return
                 if path == "/api/viewer-ping":
                     server_ref.last_viewer_ping = time.monotonic()
                     self.send_response(HTTPStatus.NO_CONTENT)
@@ -12414,12 +12419,39 @@ async def run_manifest(
         unregister_active_run(runner.run_id)
 
 
-def hud_is_alive(port: int) -> bool:
+def hud_identity(state_dir: Path, model_log_path: Path) -> dict[str, Any]:
+    return {
+        "service": "ringer-hud", "protocol": 1,
+        "state_dir": str(state_dir.expanduser().resolve()),
+        "model_log_path": str(model_log_path.expanduser().resolve()),
+        "active_runs_path": str(active_runs_path().expanduser().resolve()),
+    }
+
+
+def hud_is_healthy(port: int, config: AppConfig) -> bool:
+    """Return False only for an absent listener; never reuse an unknown service."""
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs", timeout=0.4) as response:
-            return response.status == 200
-    except Exception:
-        return False
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/identity", timeout=0.4) as response:
+            identity = json.load(response)
+    except urllib.error.URLError as exc:
+        if isinstance(exc, urllib.error.HTTPError):
+            exc.close()
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return False
+        raise RuntimeError(
+            f"Cannot verify Ringside identity on port {port}. The port may contain an older "
+            "dashboard or another service; stop the identified dashboard manually or choose another port."
+        ) from exc
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"Cannot verify Ringside identity on port {port}; choose another port.") from exc
+    expected = hud_identity(config.state_dir, config.eval.jsonl_path)
+    if identity != expected:
+        raise RuntimeError(
+            f"Ringside on port {port} has incompatible data paths or protocol; "
+            f"expected state {expected['state_dir']} and model log {expected['model_log_path']}. "
+            "Stop the identified dashboard manually or choose another port."
+        )
+    return True
 
 
 def open_in_browser(url: str) -> None:
@@ -12559,24 +12591,42 @@ def ensure_hud_running(config: AppConfig, *, open_browser: bool) -> None:
     """
     port = config.hud_port
     url = f"http://127.0.0.1:{port}"
-    already_alive = hud_is_alive(port)
+    already_alive = hud_is_healthy(port, config)
     if not already_alive:
         log_path = config.state_dir / "hud.log"
-        with contextlib.suppress(Exception):
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("ab") as log_file:
-                subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "hud", "--no-open", "--port", str(port)],
-                    stdout=log_file,
-                    stderr=log_file,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-        for _ in range(20):
-            if hud_is_alive(port):
-                break
-            time.sleep(0.15)
-    if open_browser and not already_alive and hud_is_alive(port):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        argv = [sys.executable, str(Path(__file__).resolve())]
+        if config.path is not None:
+            argv += ["--config", str(config.path.expanduser().resolve())]
+        # Pass the effective paths even for programmatic/no-file configurations.
+        argv += ["hud", "--no-open", "--port", str(port),
+                 "--state-dir", str(config.state_dir.expanduser().resolve()),
+                 "--model-log-path", str(config.eval.jsonl_path.expanduser().resolve())]
+        with log_path.open("ab") as log_file:
+            child = subprocess.Popen(
+                argv, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        try:
+            for _ in range(40):
+                if child.poll() is not None:
+                    raise RuntimeError(f"Ringside exited before readiness; see {log_path}")
+                if hud_is_healthy(port, config):
+                    break
+                time.sleep(0.15)
+            else:
+                raise RuntimeError(f"Ringside did not become ready; see {log_path}")
+        except BaseException:
+            # Only the child launched here is ours to terminate.
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2)
+            raise
+    if open_browser and not already_alive:
         if not (config.reuse_open_tab and hud_has_recent_viewer(port)):
             open_in_browser(url)
     print(f"Ringside: {url}", flush=True)
@@ -12586,7 +12636,7 @@ def run_persistent_hud(
     config: AppConfig, *, port: int | None, open_viewer: bool, force_open: bool = False,
 ) -> int:
     chosen_port = port if port is not None else config.hud_port
-    if hud_is_alive(chosen_port):
+    if hud_is_healthy(chosen_port, config):
         url = f"http://127.0.0.1:{chosen_port}"
         if open_viewer and not force_open and config.reuse_open_tab and hud_has_recent_viewer(chosen_port):
             print(
@@ -12793,6 +12843,8 @@ def build_parser() -> argparse.ArgumentParser:
     hud_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     hud_parser.add_argument("--port", type=int, help=f"port to bind on 127.0.0.1 (default: {DEFAULT_HUD_PORT})")
     hud_parser.add_argument("--no-open", action="store_true", help="start the server without opening a browser")
+    hud_parser.add_argument("--state-dir", type=Path, help=argparse.SUPPRESS)
+    hud_parser.add_argument("--model-log-path", type=Path, help=argparse.SUPPRESS)
     hud_parser.add_argument("--force-open", action="store_true", help="open a new browser tab even if Ringside is already open")
 
     db_parser = subparsers.add_parser("db", help="manage the derived SQLite read model")
@@ -12923,6 +12975,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "models":
             return run_models_command(config, args)
         if args.command == "hud":
+            config = dataclass_replace(
+                config,
+                state_dir=args.state_dir or config.state_dir,
+                eval=dataclass_replace(config.eval, jsonl_path=args.model_log_path or config.eval.jsonl_path),
+            )
             return run_persistent_hud(
                 config,
                 port=args.port,

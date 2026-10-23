@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,14 +36,19 @@ def config(root: Path) -> AppConfig:
 
 
 class HudSingleTabTests(unittest.TestCase):
+    def setUp(self) -> None:
+        heartbeat = mock.patch.object(ringer, "hud_has_recent_viewer", return_value=False)
+        heartbeat.start()
+        self.addCleanup(heartbeat.stop)
+
     def test_already_alive_does_not_open_browser(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             opened: list[str] = []
-            original_alive = ringer.hud_is_alive
+            original_alive = ringer.hud_is_healthy
             original_open = ringer.open_in_browser
             original_popen = ringer.subprocess.Popen
             try:
-                ringer.hud_is_alive = lambda _port: True
+                ringer.hud_is_healthy = lambda _port, _config: True
                 ringer.open_in_browser = opened.append
 
                 def fail_popen(*_args: object, **_kwargs: object) -> object:
@@ -51,7 +57,7 @@ class HudSingleTabTests(unittest.TestCase):
                 ringer.subprocess.Popen = fail_popen
                 ensure_hud_running(config(Path(temp)), open_browser=True)
             finally:
-                ringer.hud_is_alive = original_alive
+                ringer.hud_is_healthy = original_alive
                 ringer.open_in_browser = original_open
                 ringer.subprocess.Popen = original_popen
             self.assertEqual([], opened)
@@ -61,21 +67,21 @@ class HudSingleTabTests(unittest.TestCase):
             opened: list[str] = []
             spawned: list[object] = []
             alive_results = iter([False, True, True])
-            original_alive = ringer.hud_is_alive
+            original_alive = ringer.hud_is_healthy
             original_open = ringer.open_in_browser
             original_popen = ringer.subprocess.Popen
             try:
-                ringer.hud_is_alive = lambda _port: next(alive_results)
+                ringer.hud_is_healthy = lambda _port, _config: next(alive_results)
                 ringer.open_in_browser = opened.append
 
                 def fake_popen(*args: object, **_kwargs: object) -> object:
                     spawned.append(args)
-                    return object()
+                    return mock.Mock(poll=mock.Mock(return_value=None))
 
                 ringer.subprocess.Popen = fake_popen
                 ensure_hud_running(config(Path(temp)), open_browser=True)
             finally:
-                ringer.hud_is_alive = original_alive
+                ringer.hud_is_healthy = original_alive
                 ringer.open_in_browser = original_open
                 ringer.subprocess.Popen = original_popen
             self.assertEqual(1, len(spawned))
