@@ -6,11 +6,9 @@ import contextlib
 import io
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -25,7 +23,6 @@ from ringer import (  # noqa: E402
     aggregate_model_scoreboard_rows,
     build_models_api_payload,
     db_attempt_rows,
-    invalidate_model_log_rows,
     read_model_log_rows,
     rebuild_read_model_db,
     run_models_command,
@@ -128,84 +125,80 @@ class ModelInvalidationTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_run_only_invalidation_marks_all_matching_rows_and_preserves_mode(self) -> None:
+    def amendments(self) -> list[dict[str, object]]:
+        path = self.root / "amendments.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def invalidate(self, **overrides: object) -> tuple[int, str, str]:
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = run_models_command(self.config, self.model_args(invalidate=True, **overrides))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_invalidate_alias_appends_amendments_and_never_rewrites_log(self) -> None:
         write_jsonl(
             self.log_path,
             [
-                attempt("run-1", "a"),
+                attempt("run-1", "a", verdict="FAIL"),
                 attempt("run-1", "b", verdict="FAIL"),
-                attempt("run-2", "a"),
+                attempt("run-2", "a", verdict="FAIL"),
             ],
         )
-        os.chmod(self.log_path, 0o640)
+        before = self.log_path.read_bytes()
 
-        result = invalidate_model_log_rows(
-            self.log_path,
-            run_id="run-1",
-            reason="bad harness",
-            now=datetime(2026, 7, 17, 1, 2, 3, tzinfo=timezone.utc),
+        rc, out, _err = self.invalidate(invalidate_run_id="run-1", reason="bad harness login")
+
+        self.assertEqual(0, rc)
+        self.assertIn("amended 2 task(s) as infra", out)
+        self.assertEqual(before, self.log_path.read_bytes())
+        entries = self.amendments()
+        self.assertEqual([("run-1", "a"), ("run-1", "b")], [(e["run_id"], e["task_key"]) for e in entries])
+        self.assertTrue(all(e["cause"] == "infra" and e["attempt"] is None for e in entries))
+        self.assertEqual("bad harness login", entries[0]["note"])
+
+    def test_invalidate_alias_task_selector_and_cause(self) -> None:
+        write_jsonl(self.log_path, [attempt("run-1", "a", verdict="FAIL"), attempt("run-1", "b", verdict="FAIL")])
+
+        rc, _out, _err = self.invalidate(
+            invalidate_run_id="run-1", invalidate_task_key="b", invalidate_cause="check", reason="check was wrong"
         )
 
-        self.assertEqual((2, 2, 0), (result.matched, result.newly_invalidated, result.already_invalidated))
-        self.assertEqual(0o640, self.log_path.stat().st_mode & 0o777)
-        rows = [json.loads(line) for line in self.log_path.read_text(encoding="utf-8").splitlines()]
-        self.assertTrue(rows[0]["evidence_excluded"])
-        self.assertEqual("2026-07-17T01:02:03+00:00", rows[0]["invalidated_at"])
-        self.assertEqual("bad harness", rows[1]["invalidation_reason"])
-        self.assertNotIn("evidence_excluded", rows[2])
+        self.assertEqual(0, rc)
+        self.assertEqual([("b", "check")], [(e["task_key"], e["cause"]) for e in self.amendments()])
 
-    def test_run_and_task_selection_and_byte_preservation(self) -> None:
-        malformed = b"{not json}\n"
-        unrelated = json.dumps(attempt("other", "a")).encode("utf-8") + b"\n"
-        target = json.dumps(attempt("run-1", "a")).encode("utf-8") + b"\n"
-        other_task = json.dumps(attempt("run-1", "b")).encode("utf-8") + b"\n"
-        self.log_path.write_bytes(malformed + target + unrelated + other_task)
+    def test_invalidate_alias_skips_all_pass_tasks(self) -> None:
+        write_jsonl(self.log_path, [attempt("run-1", "a"), attempt("run-1", "b", verdict="FAIL")])
 
-        result = invalidate_model_log_rows(self.log_path, run_id="run-1", task_key="a", reason="wrong task")
+        rc, _out, err = self.invalidate(invalidate_run_id="run-1", reason="bad harness login")
 
-        self.assertEqual((1, 1, 0), (result.matched, result.newly_invalidated, result.already_invalidated))
-        lines = self.log_path.read_bytes().splitlines(keepends=True)
-        self.assertEqual(malformed, lines[0])
-        self.assertEqual(unrelated, lines[2])
-        self.assertEqual(other_task, lines[3])
-        self.assertEqual("wrong task", json.loads(lines[1])["invalidation_reason"])
+        self.assertEqual(0, rc)
+        self.assertIn("a PASS cannot be amended", err)
+        self.assertEqual(["b"], [e["task_key"] for e in self.amendments()])
 
-    def test_mixed_and_repeat_preserve_existing_invalidation_metadata(self) -> None:
-        already_line = (
-            b'{"run_id":"run-1","task_key":"old","worker_engine":"opencode","model":"openrouter/acme/live",'
-            b'"task_type":"code-feature","evidence_excluded":true,"invalidated_at":"old-ts",'
-            b'"invalidation_reason":"old reason","verdict":"PASS","logged_at":"2026-07-06T10:00:00+00:00"}\n'
-        )
-        live_line = json.dumps(attempt("run-1", "new")).encode("utf-8") + b"\n"
-        self.log_path.write_bytes(already_line + live_line)
-
-        first = invalidate_model_log_rows(self.log_path, run_id="run-1", reason="new reason")
-        after_first = self.log_path.read_bytes()
-        second = invalidate_model_log_rows(self.log_path, run_id="run-1", reason="repeat reason")
-
-        self.assertEqual((2, 1, 1), (first.matched, first.newly_invalidated, first.already_invalidated))
-        self.assertEqual((2, 0, 2), (second.matched, second.newly_invalidated, second.already_invalidated))
-        self.assertEqual(after_first, self.log_path.read_bytes())
-        self.assertEqual(already_line, after_first.splitlines(keepends=True)[0])
+        write_jsonl(self.log_path, [attempt("run-9", "a")])
+        rc, _out, _err = self.invalidate(invalidate_run_id="run-9", reason="bad harness login")
+        self.assertEqual(1, rc)
 
     def test_cli_rejects_missing_inputs_and_reports_no_match(self) -> None:
-        write_jsonl(self.log_path, [attempt("run-1", "a")])
+        write_jsonl(self.log_path, [attempt("run-1", "a", verdict="FAIL")])
 
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(2, run_models_command(self.config, self.model_args(invalidate=True, reason="x")))
-        self.assertIn("requires --run", err.getvalue())
+        rc, _out, err = self.invalidate(reason="bad harness login")
+        self.assertEqual(2, rc)
+        self.assertIn("requires --run", err)
 
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(2, run_models_command(self.config, self.model_args(invalidate=True, invalidate_run_id="run-1")))
-        self.assertIn("non-empty --reason", err.getvalue())
+        rc, _out, err = self.invalidate(invalidate_run_id="run-1")
+        self.assertEqual(2, rc)
+        self.assertIn("non-empty --reason", err)
 
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            rc = run_models_command(
-                self.config,
-                self.model_args(invalidate=True, invalidate_run_id="missing", reason="x"),
-            )
+        rc, _out, err = self.invalidate(invalidate_run_id="run-1", reason="short")
+        self.assertEqual(2, rc)
+        self.assertIn("at least 10 characters", err)
+
+        rc, _out, err = self.invalidate(invalidate_run_id="missing", reason="bad harness login")
         self.assertEqual(1, rc)
-        self.assertIn("No matching model log rows", err.getvalue())
+        self.assertIn("No matching model log rows", err)
+        self.assertEqual([], self.amendments())
 
     def test_aggregates_exclude_invalidated_rows_but_keep_audit_counts_visible(self) -> None:
         rows = [
@@ -242,45 +235,18 @@ class ModelInvalidationTests(unittest.TestCase):
         cli_groups = json.loads(out.getvalue())
         self.assertTrue(any(group["invalidated_rows"] == 1 for group in cli_groups))
 
-    def test_db_rebuild_and_sync_stop_crediting_newly_invalidated_rows(self) -> None:
+    def test_invalidate_alias_is_applied_on_the_db_read_path(self) -> None:
         write_jsonl(self.log_path, [attempt("run-1", "a"), attempt("run-2", "a", verdict="FAIL")])
         rebuild_read_model_db(self.db_path, self.log_path)
 
-        result = invalidate_model_log_rows(self.log_path, run_id="run-2", reason="bad run")
-        self.assertEqual(1, result.newly_invalidated)
-        sync_result = sync_read_model_db(self.db_path, self.log_path)
-
-        self.assertTrue(sync_result.rebuilt)
-        db_rows, _registry = db_attempt_rows(self.db_path)
-        by_model = {row["model"]: row for row in aggregate_model_scoreboard_rows(db_rows)}
-        self.assertEqual(1, by_model["openrouter/acme/live"]["tasks"])
-        self.assertEqual(1, by_model["openrouter/acme/live"]["attempts"])
-        self.assertEqual(1, by_model["openrouter/acme/live"]["invalidated_rows"])
-        with sqlite3.connect(self.db_path) as conn:
-            self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0])
-
-    def test_invalidate_command_rebuilds_selected_default_read_model(self) -> None:
-        write_jsonl(self.log_path, [attempt("run-1", "a"), attempt("run-2", "a", verdict="FAIL")])
-        rebuild_read_model_db(self.db_path, self.log_path)
+        rc, _out, _err = self.invalidate(db=self.db_path, invalidate_run_id="run-2", reason="operator correction")
+        self.assertEqual(0, rc)
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            rc = run_models_command(
-                self.config,
-                self.model_args(
-                    db=self.db_path,
-                    invalidate=True,
-                    invalidate_run_id="run-2",
-                    reason="operator correction",
-                ),
-            )
-
-        self.assertEqual(0, rc)
-        self.assertIn("newly_invalidated=1 already_invalidated=0", out.getvalue())
-        db_rows, _registry = db_attempt_rows(self.db_path)
-        row = aggregate_model_scoreboard_rows(db_rows)[0]
-        self.assertEqual(1, row["tasks"])
-        self.assertEqual(1, row["invalidated_rows"])
-        self.assertEqual(1.0, row["pass_rate"])
+            self.assertEqual(0, run_models_command(self.config, self.model_args(db=self.db_path, json=True)))
+        groups = json.loads(out.getvalue())
+        self.assertEqual(1, sum(group["attempts"] for group in groups))
+        self.assertEqual(1.0, groups[0]["pass_rate"])
 
     def test_unchanged_sync_skips_prefix_hash_and_metadata_change_validates(self) -> None:
         write_jsonl(self.log_path, [attempt("run-1", "a")])

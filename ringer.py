@@ -6571,122 +6571,6 @@ def read_model_log_rows(
     return rows, skipped
 
 
-@dataclass(frozen=True)
-class ModelInvalidationResult:
-    path: Path
-    matched: int
-    newly_invalidated: int
-    already_invalidated: int
-
-
-def model_log_row_matches_invalidation(
-    row: dict[str, Any],
-    *,
-    run_id: str,
-    task_key: str | None = None,
-) -> bool:
-    if model_log_text(row.get("run_id")) != run_id:
-        return False
-    if task_key is not None and model_log_text(row.get("task_key")) != task_key:
-        return False
-    return True
-
-
-def _line_ending(raw_line: bytes) -> bytes:
-    if raw_line.endswith(b"\r\n"):
-        return b"\r\n"
-    if raw_line.endswith(b"\n"):
-        return b"\n"
-    return b""
-
-
-def invalidate_model_log_rows(
-    path: Path,
-    *,
-    run_id: str,
-    task_key: str | None = None,
-    reason: str,
-    now: datetime | None = None,
-) -> ModelInvalidationResult:
-    path = path.expanduser().resolve()
-    reason = reason.strip()
-    run_id = run_id.strip()
-    task_key = (task_key.strip() or None) if task_key is not None else None
-    if not run_id:
-        raise ValueError("--run is required for --invalidate")
-    if not reason:
-        raise ValueError("--reason must be non-empty for --invalidate")
-    try:
-        original_stat = path.stat()
-    except FileNotFoundError:
-        return ModelInvalidationResult(path, 0, 0, 0)
-    mode = original_stat.st_mode & 0o7777
-    invalidated_at = (now or datetime.now(timezone.utc)).replace(microsecond=0).isoformat()
-    fd: int | None = None
-    tmp_path: Path | None = None
-    matched = 0
-    newly_invalidated = 0
-    already_invalidated = 0
-    try:
-        fd, tmp_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        tmp_path = Path(tmp_name)
-        with path.open("rb") as src, os.fdopen(fd, "wb") as dst:
-            if hasattr(os, "fchmod"):
-                os.fchmod(dst.fileno(), mode)
-            fd = None
-            while True:
-                raw_line = src.readline()
-                if not raw_line:
-                    break
-                output = raw_line
-                try:
-                    row = json.loads(raw_line.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    dst.write(output)
-                    continue
-                if not isinstance(row, dict) or not model_log_row_matches_invalidation(
-                    row,
-                    run_id=run_id,
-                    task_key=task_key,
-                ):
-                    dst.write(output)
-                    continue
-                matched += 1
-                if model_log_row_is_invalidated(row):
-                    already_invalidated += 1
-                    dst.write(output)
-                    continue
-                row["evidence_excluded"] = True
-                row["invalidated_at"] = invalidated_at
-                row["invalidation_reason"] = reason
-                output = json.dumps(row, sort_keys=True).encode("utf-8") + _line_ending(raw_line)
-                newly_invalidated += 1
-                dst.write(output)
-            dst.flush()
-            os.fsync(dst.fileno())
-        if newly_invalidated:
-            os.replace(tmp_path, path)
-            tmp_path = None
-            with contextlib.suppress(OSError):
-                dir_fd = os.open(path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-    finally:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
-    return ModelInvalidationResult(path, matched, newly_invalidated, already_invalidated)
-
-
 AMEND_CAUSES = ("check", "infra", "spec", "worker")
 AMEND_EXCLUDING_CAUSES = frozenset({"check", "infra", "spec"})
 AMEND_MIN_NOTE_CHARS = 10
@@ -9629,62 +9513,61 @@ def build_models_api_payload(
 
 
 def run_models_invalidate_command(config: AppConfig, args: argparse.Namespace) -> int:
-    default_log_path = config.eval.jsonl_path.expanduser().resolve()
-    log_path = (args.log or default_log_path).expanduser().resolve()
+    """`models --invalidate` is kept as an alias that records amendments.
+
+    The eval log is never rewritten; see `ringer.py amend`. Every task matched
+    by --run (and --task) gets one amendment covering its non-PASS attempts.
+    """
+    log_path = (args.log or config.eval.jsonl_path).expanduser().resolve()
     run_id = model_log_text(getattr(args, "invalidate_run_id", ""))
     task_key = model_log_text(getattr(args, "invalidate_task_key", "")) or None
     reason = model_log_text(getattr(args, "reason", ""))
+    cause = getattr(args, "invalidate_cause", None) or "infra"
     if not run_id:
         print("models --invalidate requires --run <run_id>", file=sys.stderr)
         return 2
     if not reason:
         print("models --invalidate requires a non-empty --reason <text>", file=sys.stderr)
         return 2
-    try:
-        result = invalidate_model_log_rows(
-            log_path,
-            run_id=run_id,
-            task_key=task_key,
-            reason=reason,
-        )
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+    if cause not in AMEND_EXCLUDING_CAUSES:
+        print(f"models --invalidate --cause must be one of {', '.join(sorted(AMEND_EXCLUDING_CAUSES))}", file=sys.stderr)
         return 2
-    except OSError as exc:
-        print(f"models invalidate failed: {exc}", file=sys.stderr)
-        return 1
-    selector = f"run={run_id}" + (f" task={task_key}" if task_key else "")
-    if result.matched == 0:
-        print(f"No matching model log rows for {selector} in {result.path}", file=sys.stderr)
-        return 1
-    print(
-        f"models invalidation: {selector}; "
-        f"newly_invalidated={result.newly_invalidated} "
-        f"already_invalidated={result.already_invalidated} log={result.path}"
+    attempts_by_task = attempts_by_task_from_log(log_path)
+    keys = sorted(
+        key for key in attempts_by_task
+        if key[0] == run_id and (task_key is None or key[1] == task_key)
     )
-    explicit_db = getattr(args, "db", None) is not None
-    db_path = (getattr(args, "db", None) or default_read_model_db_path()).expanduser().resolve()
-    if result.newly_invalidated and should_use_read_model_db(
-        log_path=log_path,
-        default_log_path=default_log_path,
-        explicit_db=explicit_db,
-    ):
-        catalog_path = (getattr(args, "catalog_file", None) or default_catalog_path()).expanduser().resolve()
-        registry_path = (getattr(args, "registry", None) or default_model_registry_path()).expanduser().resolve()
-        try:
-            rebuild_read_model_db(
-                db_path,
-                log_path,
-                catalog_path=catalog_path,
-                registry_path=registry_path,
-            )
-        except Exception as exc:
-            print(
-                f"models invalidation wrote {result.path}, but read-model rebuild failed: {exc}",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"models invalidation: rebuilt read model {db_path}")
+    selector = f"run={run_id}" + (f" task={task_key}" if task_key else "")
+    if not keys:
+        print(f"No matching model log rows for {selector} in {log_path}", file=sys.stderr)
+        return 1
+    entries: list[dict[str, Any]] = []
+    all_pass: list[str] = []
+    for run, key in keys:
+        if all(model_log_row_is_pass(row) for row in attempts_by_task[(run, key)]):
+            all_pass.append(key)
+            continue
+        entry = {"run_id": run, "task_key": key, "attempt": None, "cause": cause, "note": reason}
+        error, _numbers = validate_amendment_entry(entry, attempts_by_task)
+        if error:
+            print(f"models --invalidate: {error}", file=sys.stderr)
+            return 2
+        entries.append(entry)
+    if all_pass:
+        print(
+            f"models --invalidate: skipped {len(all_pass)} task(s) whose attempts all PASS "
+            f"(a PASS cannot be amended): {', '.join(all_pass)}",
+            file=sys.stderr,
+        )
+    if not entries:
+        return 1
+    by = os.environ.get("USER") or "unknown"
+    amend_path = amendments_path(log_path)
+    append_text(amend_path, "".join(json.dumps(amendment_record(entry, by)) + "\n" for entry in entries))
+    print(
+        f"models invalidation: {selector}; amended {len(entries)} task(s) as {cause} "
+        f"in {amend_path} (prefer `ringer.py amend`)"
+    )
     return 0
 
 
@@ -13291,6 +13174,7 @@ def build_parser() -> argparse.ArgumentParser:
     models_parser.add_argument("--run", dest="invalidate_run_id", help="run_id selector for --invalidate")
     models_parser.add_argument("--task", dest="invalidate_task_key", help="task_key selector for --invalidate")
     models_parser.add_argument("--reason", help="non-empty invalidation reason for --invalidate")
+    models_parser.add_argument("--cause", dest="invalidate_cause", choices=sorted(AMEND_EXCLUDING_CAUSES), help="amendment cause for --invalidate (default: infra)")
 
     amend_parser = subparsers.add_parser("amend", help="correct the record: exclude attempts the model did not cause")
     amend_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
