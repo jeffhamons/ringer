@@ -6789,6 +6789,11 @@ def run_amend_command(config: AppConfig, args: argparse.Namespace) -> int:
             if not isinstance(entry, dict):
                 problems.append(f"line {number}: expected a JSON object")
                 continue
+            if "include_pass" in entry:
+                # Whole-task exclusion is `models --invalidate` only; a line
+                # copied from amendments.jsonl must not drop another task's passes.
+                problems.append(f"line {number}: include_pass is reserved for models --invalidate")
+                continue
             error, _numbers = validate_amendment_entry(entry, attempts_by_task)
             if error:
                 problems.append(f"line {number}: {error}")

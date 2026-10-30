@@ -204,6 +204,22 @@ class ModelInvalidationTests(unittest.TestCase):
         error, _numbers = ringer.validate_amendment_entry(entry, ringer.attempts_by_task_from_log(self.log_path))
         self.assertIn("cannot be combined", error or "")
 
+    def test_amend_from_file_rejects_include_pass(self) -> None:
+        write_jsonl(self.log_path, [attempt("run-1", "a")])
+        batch = self.root / "batch.jsonl"
+        batch.write_text(json.dumps({
+            "run_id": "run-1", "task_key": "a", "attempt": None, "cause": "check",
+            "note": "copied from amendments.jsonl", "include_pass": True,
+        }) + "\n", encoding="utf-8")
+        args = argparse.Namespace(
+            log=self.log_path, list=False, run=None, identity=None, from_file=batch,
+            run_id=None, task_key=None, cause=None, note=None, attempt=None,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(2, ringer.run_amend_command(self.config, args))
+        self.assertIn("reserved for models --invalidate", out.getvalue())
+        self.assertEqual([], self.amendments())
+
     def test_cli_rejects_missing_inputs_and_reports_no_match(self) -> None:
         write_jsonl(self.log_path, [attempt("run-1", "a", verdict="FAIL")])
 
