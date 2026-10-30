@@ -2589,6 +2589,9 @@ class WorkerResult:
     error: str | None = None
     reported_model: str | None = None
     engine_down_reason: str | None = None
+    # Last few lines the worker printed; kept on non-PASS eval rows so the
+    # cause survives later runs overwriting the worker log.
+    output_tail: str = ""
     terminal_status: str = "UNKNOWN"
     terminal_subtype: str | None = None
     terminal_num_turns: int | None = None
@@ -10120,16 +10123,26 @@ class RingerRunner:
         procs = list(self.active_processes.values())
         await asyncio.gather(*(stop_worker_process_tree(proc, grace_s=1) for proc in procs))
 
-    def _engine_down_reason(self, engine_name: str) -> str | None:
-        with self.lock:
-            return self.engine_down.get(engine_name)
+    def _engine_down_keys(self, task: TaskSpec) -> tuple[str, str]:
+        # A dead account takes the whole engine down; a missing model only
+        # takes down that model, so other models on the engine keep running.
+        engine = self.config.engines.get(task.engine)
+        model = task.model or (engine.model_default if engine else "") or ""
+        return task.engine, f"{task.engine}/{model}"
 
-    def _mark_engine_down(self, engine_name: str, reason: str) -> str:
+    def _engine_down_reason(self, task: TaskSpec) -> str | None:
+        engine_key, model_key = self._engine_down_keys(task)
         with self.lock:
-            existing = self.engine_down.get(engine_name)
+            return self.engine_down.get(engine_key) or self.engine_down.get(model_key)
+
+    def _mark_engine_down(self, task: TaskSpec, reason: str) -> str:
+        engine_key, model_key = self._engine_down_keys(task)
+        key = model_key if engine_down_scope(reason) == "model" else engine_key
+        with self.lock:
+            existing = self.engine_down.get(engine_key) or self.engine_down.get(key)
             if existing is not None:
                 return existing
-            self.engine_down[engine_name] = reason
+            self.engine_down[key] = reason
             return reason
 
     async def _finalize_engine_down(
@@ -10325,7 +10338,7 @@ class RingerRunner:
                         "config and re-run.\n",
                     )
                 return
-            down_reason = self._engine_down_reason(runtime.task.engine)
+            down_reason = self._engine_down_reason(runtime.task)
             if down_reason is not None:
                 await self._finalize_engine_down(runtime, down_reason, worker=None, attempt=1, duration_ms=0)
                 return
@@ -10336,7 +10349,7 @@ class RingerRunner:
             current_spec = runtime.task.spec
             max_attempts = runtime.task.max_attempts
             for attempt in range(1, max_attempts + 1):
-                down_reason = self._engine_down_reason(runtime.task.engine)
+                down_reason = self._engine_down_reason(runtime.task)
                 if down_reason is not None:
                     await self._finalize_engine_down(
                         runtime, down_reason, worker=None, attempt=attempt, duration_ms=0
@@ -10363,7 +10376,7 @@ class RingerRunner:
                 # before the fast-fail branch makes this runtime terminal.
                 self._refresh_cost(runtime)
                 if worker.engine_down_reason is not None:
-                    reason = self._mark_engine_down(runtime.task.engine, worker.engine_down_reason)
+                    reason = self._mark_engine_down(runtime.task, worker.engine_down_reason)
                     duration_ms = int((time.monotonic() - attempt_started) * 1000)
                     await self._finalize_engine_down(
                         runtime, reason, worker=worker, attempt=attempt, duration_ms=duration_ms
@@ -10703,6 +10716,7 @@ class RingerRunner:
             log_fh = log_path.open("ab")
         except OSError as exc:
             return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+        worker_started = time.monotonic()
         async with AsyncFileCloser(log_fh):
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -10748,7 +10762,9 @@ class RingerRunner:
             # the last thing the process prints before it dies. Scanning the
             # full ~1MB capture would also catch a coding task's own mid-run
             # narration about payment/auth handling it's implementing.
-            else detect_engine_down_reason(output_tail[-2000:])
+            else detect_engine_down_reason(
+                output_tail[-2000:], duration_s=time.monotonic() - worker_started
+            )
         )
         if timed_out:
             append_text(log_path, f"\n[ringer.py] worker timed out after {runtime.task.timeout_s}s\n")
@@ -10756,8 +10772,13 @@ class RingerRunner:
         if engine_down_reason is not None:
             append_text(
                 log_path,
-                f"[ringer.py] engine-down detected ({engine_down_reason}); "
-                f"marking engine '{runtime.task.engine}' down for this run\n",
+                f"[ringer.py] engine-down detected ({engine_down_reason}); marking "
+                + (
+                    f"model '{runtime.task.model or engine.model_default}' on engine '{runtime.task.engine}'"
+                    if engine_down_scope(engine_down_reason) == "model"
+                    else f"engine '{runtime.task.engine}'"
+                )
+                + " down for this run\n",
             )
         return WorkerResult(
             returncode=proc.returncode,
@@ -10765,6 +10786,7 @@ class RingerRunner:
             tokens=tokens,
             reported_model=reported_model,
             engine_down_reason=engine_down_reason,
+            output_tail=output_tail[-WORKER_OUTPUT_TAIL_CHARS:],
             terminal_status=terminal_status,
             terminal_subtype=terminal_subtype,
             terminal_num_turns=terminal_num_turns,
@@ -10890,6 +10912,11 @@ class RingerRunner:
                 "worker_terminal_num_turns": worker.terminal_num_turns,
                 "check_returncode": verify.check_returncode,
                 "check_timed_out": verify.check_timed_out,
+                **(
+                    {"worker_output_tail": redact_secrets(ANSI_RE.sub("", worker.output_tail))}
+                    if verdict != "PASS" and worker.output_tail
+                    else {}
+                ),
                 "notes": "\n".join(notes_parts),
                 "orchestrator": self.identity,
                 "model": stamped_model,
@@ -11147,13 +11174,56 @@ ENGINE_DOWN_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("invalid_api_key", re.compile(r"invalid[\s_-]*api[\s_-]?key", re.IGNORECASE)),
     ("unauthorized", re.compile(r"\b401\b[^\n]{0,40}unauthorized", re.IGNORECASE)),
     ("unauthorized", re.compile(r"unauthorized[^\n]{0,40}\b401\b", re.IGNORECASE)),
+    # Signatures below were collected upstream (NateBJones-Projects/ringer#154)
+    # from 747 attempts that died before doing any work. Transient throttling
+    # (rate_limit_error, overloaded_error, 429) is left out on purpose: it is
+    # worth a retry and must not take an engine down for the whole run.
+    (
+        "auth_required",
+        re.compile(
+            r"refresh_token_(?:invalidated|reused|expired)|authentication_error"
+            r"|please run /login|not logged in"
+            r"|run `?(?:codex|grok|claude) login",
+            re.IGNORECASE,
+        ),
+    ),
+    ("credit_exhausted", re.compile(r"can only afford|credit balance is too low", re.IGNORECASE)),
+    (
+        "usage_limit",
+        re.compile(r"usage limit reached|hit your limit|exceeded your current quota", re.IGNORECASE),
+    ),
+    ("model_unavailable", re.compile(r"no endpoints found|model_not_found", re.IGNORECASE)),
+    ("interop", re.compile(r"exec format error|UtilBindVsock", re.IGNORECASE)),
 )
 
 
-def detect_engine_down_reason(output: str) -> str | None:
+# Bare status codes also appear in ordinary output (a test printing "401", a
+# diff touching a 404 page), so they only count when the worker died fast --
+# a dead login or account fails in seconds, real work does not.
+ENGINE_DOWN_WEAK_MAX_S = 60.0
+ENGINE_DOWN_WEAK_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("unauthorized", re.compile(r"\b401\b|unauthori[sz]ed", re.IGNORECASE)),
+    ("payment_required", re.compile(r"\b402\b", re.IGNORECASE)),
+    ("model_unavailable", re.compile(r"\b404\b.{0,40}model|\bmodel\b.{0,40}not found", re.IGNORECASE)),
+)
+# Reasons that condemn one model rather than the whole engine or account.
+MODEL_SCOPED_ENGINE_DOWN_REASONS = frozenset({"model_unavailable"})
+WORKER_OUTPUT_TAIL_CHARS = 1500
+
+
+def engine_down_scope(reason: str) -> str:
+    return "model" if reason in MODEL_SCOPED_ENGINE_DOWN_REASONS else "engine"
+
+
+def detect_engine_down_reason(output: str, *, duration_s: float | None = None) -> str | None:
+    output = ANSI_RE.sub("", output)
     for reason, pattern in ENGINE_DOWN_PATTERNS:
         if pattern.search(output):
             return reason
+    if duration_s is not None and duration_s <= ENGINE_DOWN_WEAK_MAX_S:
+        for reason, pattern in ENGINE_DOWN_WEAK_PATTERNS:
+            if pattern.search(output):
+                return reason
     return None
 
 

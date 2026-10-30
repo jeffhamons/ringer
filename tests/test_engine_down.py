@@ -25,6 +25,7 @@ from ringer import (  # noqa: E402
     aggregate_model_log_rows,
     aggregate_model_scoreboard_rows,
     detect_engine_down_reason,
+    engine_down_scope,
 )
 
 
@@ -51,6 +52,40 @@ class DetectEngineDownReasonTests(unittest.TestCase):
     def test_matches_insufficient_credit_phrasing(self) -> None:
         self.assertIsNotNone(detect_engine_down_reason("insufficient credits remaining"))
         self.assertIsNotNone(detect_engine_down_reason("Insufficient quota for this request"))
+
+    def test_matches_login_billing_quota_and_interop_signatures(self) -> None:
+        for text in (
+            "error: refresh_token_invalidated; run `codex login`",
+            "Not logged in. Please run /login",
+            "Your credit balance is too low to access the API",
+            "This request can only afford 1200 tokens",
+            "Usage limit reached for this plan",
+            "You've hit your limit, resets at 5pm",
+            "You exceeded your current quota",
+            "exec format error",
+            "UtilBindVsock failed",
+        ):
+            with self.subTest(text):
+                self.assertIsNotNone(detect_engine_down_reason(text))
+
+    def test_transient_rate_limits_stay_retryable(self) -> None:
+        for text in ("rate_limit_error: slow down", "overloaded_error", "429 Too Many Requests"):
+            with self.subTest(text):
+                self.assertIsNone(detect_engine_down_reason(text, duration_s=2.0))
+
+    def test_bare_status_codes_only_count_on_fast_exits(self) -> None:
+        self.assertEqual("unauthorized", detect_engine_down_reason("HTTP 401", duration_s=3.0))
+        self.assertEqual("payment_required", detect_engine_down_reason("status 402", duration_s=3.0))
+        self.assertIsNone(detect_engine_down_reason("HTTP 401", duration_s=600.0))
+        self.assertIsNone(detect_engine_down_reason("HTTP 401"))
+
+    def test_model_unavailable_is_scoped_to_the_model(self) -> None:
+        reason = detect_engine_down_reason('{"error":{"code":"model_not_found"}}')
+        self.assertEqual("model_unavailable", reason)
+        self.assertEqual("model", engine_down_scope(reason))
+        self.assertEqual("model_unavailable", detect_engine_down_reason("No endpoints found for acme/gone"))
+        self.assertEqual("model_unavailable", detect_engine_down_reason("404: model foo not found", duration_s=1.0))
+        self.assertEqual("engine", engine_down_scope("http_402"))
 
     def test_ignores_ordinary_worker_output(self) -> None:
         self.assertIsNone(detect_engine_down_reason("mock-worker: wrote 1 file(s): hello.txt"))
@@ -282,6 +317,94 @@ class EngineDownFastFailEndToEndTests(unittest.TestCase):
             self.assertEqual(3, len(log_rows))
             for row in log_rows:
                 self.assertEqual("ENGINE_DOWN", row["verdict"])
+
+
+class ModelUnavailableScopeEndToEndTests(unittest.TestCase):
+    def test_dead_model_is_skipped_while_the_engine_keeps_serving_other_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            (root / "home").mkdir()
+            (root / "ringer-home").mkdir()
+            workdir = root / "work"
+            fake = root / "fake_engine.py"
+            fake.write_text(
+                "import pathlib, sys\n"
+                "model = sys.argv[1]\n"
+                "if model == 'gone':\n"
+                "    print('Error: model_not_found: the model gone does not exist')\n"
+                "    sys.exit(1)\n"
+                "pathlib.Path('hello.txt').write_text('hello')\n"
+                "print('wrote hello.txt')\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.toml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        f"state_dir = {toml_string(root / 'state')}",
+                        "",
+                        "[eval]",
+                        'backend = "jsonl"',
+                        f"jsonl_path = {toml_string(root / 'runs.jsonl')}",
+                        "",
+                        "[artifact]",
+                        "enabled = false",
+                        "",
+                        "[engines.fake]",
+                        f"bin = {toml_string(sys.executable)}",
+                        f"args_template = [{toml_string(fake)}, \"{{model}}\", \"{{spec}}\"]",
+                        'model_default = "alive"',
+                        "sandbox_args = []",
+                        "full_access_args = []",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            check = "grep -q hello hello.txt || { echo FAIL: missing; exit 1; }"
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "run_name": "model-scope-test",
+                        "workdir": str(workdir),
+                        "max_parallel": 1,
+                        "worktrees": False,
+                        "tasks": [
+                            {"key": "gone-one", "engine": "fake", "model": "gone", "spec": "write hello", "check": check},
+                            {"key": "gone-two", "engine": "fake", "model": "gone", "spec": "write hello", "check": check},
+                            {"key": "alive", "engine": "fake", "model": "alive", "spec": "write hello", "check": check},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["HOME"] = str(root / "home")
+            env["RINGER_HOME"] = str(root / "ringer-home")
+            env["XDG_CONFIG_HOME"] = str(root / "xdg-config")
+            proc = subprocess.run(
+                [sys.executable, "ringer.py", "run", str(manifest_path), "--config", str(config_path),
+                 "--no-dashboard", "--identity", "model-scope-test"],
+                cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False, timeout=60,
+            )
+            out = proc.stdout + proc.stderr
+            self.assertRegex(out, re.compile(r"^gone-one\s+engine-down\s+ENGINE_DOWN\s+1\s+", re.MULTILINE), out)
+            self.assertRegex(out, re.compile(r"^gone-two\s+engine-down\s+ENGINE_DOWN\s+1\s+", re.MULTILINE), out)
+            self.assertRegex(out, re.compile(r"^alive\s+pass\s+PASS\s+", re.MULTILINE), out)
+            self.assertFalse((workdir / "gone-two").exists(), out)
+
+            rows = {
+                row["task_key"]: row
+                for row in (
+                    json.loads(line)
+                    for line in (root / "runs.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                )
+            }
+            self.assertIn("model_not_found", rows["gone-one"]["worker_output_tail"])
+            self.assertNotIn("worker_output_tail", rows["alive"])
 
 
 if __name__ == "__main__":
