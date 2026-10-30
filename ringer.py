@@ -2320,13 +2320,15 @@ def args_template_puts_spec_after_engine_args(args_template: Iterable[str]) -> b
 def lint_codex_writable_roots(manifest: Manifest, task: TaskSpec) -> list[str]:
     if task.engine != "codex" or any("writable_roots" in arg for arg in task.engine_args):
         return []
-    taskdir = os.path.normpath(str(Path(str(manifest.workdir)).expanduser() / task.key))
+    # realpath on both sides: the workdir may be resolved through a symlink
+    # (/var -> /private/var on macOS) while expect_files keep the raw spelling.
+    taskdir = os.path.realpath(str(Path(str(manifest.workdir)).expanduser() / task.key))
     findings: list[str] = []
     for raw in task.expect_files:
         path = Path(raw).expanduser()
         if not path.is_absolute():
             continue
-        normal = os.path.normpath(str(path))
+        normal = os.path.realpath(str(path))
         if normal == taskdir or normal.startswith(taskdir + os.sep):
             continue
         parent = os.path.dirname(normal)
