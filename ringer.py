@@ -6645,8 +6645,12 @@ def apply_amendments(rows: list[dict[str, Any]], amendments: list[dict[str, Any]
         attempt = entry.get("attempt")
         if isinstance(attempt, bool) or (attempt is not None and not isinstance(attempt, int)):
             continue
+        # include_pass (written only by `models --invalidate`) excludes the whole
+        # task, PASS rows too: a vacuous check makes every pass meaningless, and
+        # dropping only the failures would inflate the model's rates instead.
+        include_pass = entry.get("include_pass") is True
         for number, row in rows_by_task.get(key, []):
-            if model_log_row_is_pass(row):
+            if model_log_row_is_pass(row) and not include_pass:
                 continue
             if attempt is None or attempt == number:
                 row["amended_cause"] = cause
@@ -6694,6 +6698,12 @@ def validate_amendment_entry(
     if not task_rows:
         return f"run_id/task_key not found in log: {run_id} {task_key}", []
     attempt = entry.get("attempt")
+    if entry.get("include_pass") is True:
+        if attempt is not None:
+            return "include_pass applies to whole tasks; attempt must be null", []
+        if cause == "worker":
+            return "include_pass cannot be combined with cause worker", []
+        return None, list(range(1, len(task_rows) + 1))
     if attempt is None:
         numbers = [n for n, row in enumerate(task_rows, start=1) if not model_log_row_is_pass(row)]
         if not numbers:
@@ -6728,6 +6738,7 @@ def amendment_record(entry: dict[str, Any], by: str) -> dict[str, Any]:
         "cause": entry["cause"],
         "note": entry["note"].strip(),
         "by": by,
+        **({"include_pass": True} if entry.get("include_pass") is True else {}),
     }
 
 
@@ -9518,8 +9529,8 @@ def build_models_api_payload(
 def run_models_invalidate_command(config: AppConfig, args: argparse.Namespace) -> int:
     """`models --invalidate` is kept as an alias that records amendments.
 
-    The eval log is never rewritten; see `ringer.py amend`. Every task matched
-    by --run (and --task) gets one amendment covering its non-PASS attempts.
+    The eval log is never rewritten; see `ringer.py amend`. As before, every
+    attempt of every matched task is excluded, PASS rows included.
     """
     log_path = (args.log or config.eval.jsonl_path).expanduser().resolve()
     run_id = model_log_text(getattr(args, "invalidate_run_id", ""))
@@ -9545,25 +9556,20 @@ def run_models_invalidate_command(config: AppConfig, args: argparse.Namespace) -
         print(f"No matching model log rows for {selector} in {log_path}", file=sys.stderr)
         return 1
     entries: list[dict[str, Any]] = []
-    all_pass: list[str] = []
     for run, key in keys:
-        if all(model_log_row_is_pass(row) for row in attempts_by_task[(run, key)]):
-            all_pass.append(key)
-            continue
-        entry = {"run_id": run, "task_key": key, "attempt": None, "cause": cause, "note": reason}
+        entry = {
+            "run_id": run,
+            "task_key": key,
+            "attempt": None,
+            "cause": cause,
+            "note": reason,
+            "include_pass": True,
+        }
         error, _numbers = validate_amendment_entry(entry, attempts_by_task)
         if error:
             print(f"models --invalidate: {error}", file=sys.stderr)
             return 2
         entries.append(entry)
-    if all_pass:
-        print(
-            f"models --invalidate: skipped {len(all_pass)} task(s) whose attempts all PASS "
-            f"(a PASS cannot be amended): {', '.join(all_pass)}",
-            file=sys.stderr,
-        )
-    if not entries:
-        return 1
     by = os.environ.get("USER") or "unknown"
     amend_path = amendments_path(log_path)
     append_text(amend_path, "".join(json.dumps(amendment_record(entry, by)) + "\n" for entry in entries))
@@ -10786,7 +10792,7 @@ class RingerRunner:
             tokens=tokens,
             reported_model=reported_model,
             engine_down_reason=engine_down_reason,
-            output_tail=output_tail[-WORKER_OUTPUT_TAIL_CHARS:],
+            output_tail=worker_output_tail(output_tail),
             terminal_status=terminal_status,
             terminal_subtype=terminal_subtype,
             terminal_num_turns=terminal_num_turns,
@@ -10913,7 +10919,7 @@ class RingerRunner:
                 "check_returncode": verify.check_returncode,
                 "check_timed_out": verify.check_timed_out,
                 **(
-                    {"worker_output_tail": redact_secrets(ANSI_RE.sub("", worker.output_tail))}
+                    {"worker_output_tail": worker.output_tail}
                     if verdict != "PASS" and worker.output_tail
                     else {}
                 ),
@@ -11202,13 +11208,40 @@ ENGINE_DOWN_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
 # a dead login or account fails in seconds, real work does not.
 ENGINE_DOWN_WEAK_MAX_S = 60.0
 ENGINE_DOWN_WEAK_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
-    ("unauthorized", re.compile(r"\b401\b|unauthori[sz]ed", re.IGNORECASE)),
-    ("payment_required", re.compile(r"\b402\b", re.IGNORECASE)),
-    ("model_unavailable", re.compile(r"\b404\b.{0,40}model|\bmodel\b.{0,40}not found", re.IGNORECASE)),
+    (
+        "unauthorized",
+        re.compile(r"\b(?:HTTP|status|code|error)\W{0,3}401\b|\b401\W{0,3}unauthori[sz]ed", re.IGNORECASE),
+    ),
+    ("payment_required", re.compile(r"\b(?:HTTP|status|code|error)\W{0,3}402\b", re.IGNORECASE)),
+    (
+        "model_unavailable",
+        re.compile(r"\b(?:HTTP|status|code|error)\W{0,3}404\b.{0,40}\bmodel\b", re.IGNORECASE),
+    ),
 )
+# The weak codes must sit in the worker's dying words, not anywhere in the
+# 2,000-char window a traceback or test assertion can fill.
+ENGINE_DOWN_WEAK_TAIL_LINES = 5
 # Reasons that condemn one model rather than the whole engine or account.
 MODEL_SCOPED_ENGINE_DOWN_REASONS = frozenset({"model_unavailable"})
 WORKER_OUTPUT_TAIL_CHARS = 1500
+
+
+def worker_output_tail(output: str) -> str:
+    """Redacted, ANSI-free last WORKER_OUTPUT_TAIL_CHARS of worker output.
+
+    Redact BEFORE cutting: a cut landing inside a key strips the prefix the
+    redactor matches on and leaves the rest of the key in cleartext. The wide
+    window's first partial token is dropped for the same reason.
+    """
+    window = ANSI_RE.sub("", output[-(WORKER_OUTPUT_TAIL_CHARS * 4):])
+    if len(output) > WORKER_OUTPUT_TAIL_CHARS * 4:
+        parts = re.split(r"\s", window, maxsplit=1)
+        window = parts[1] if len(parts) > 1 else ""
+    redacted = redact_secrets(window)[-WORKER_OUTPUT_TAIL_CHARS:]
+    if len(redacted) == WORKER_OUTPUT_TAIL_CHARS:
+        parts = re.split(r"\s", redacted, maxsplit=1)
+        redacted = parts[1] if len(parts) > 1 else ""
+    return redacted
 
 
 def engine_down_scope(reason: str) -> str:
@@ -11221,8 +11254,11 @@ def detect_engine_down_reason(output: str, *, duration_s: float | None = None) -
         if pattern.search(output):
             return reason
     if duration_s is not None and duration_s <= ENGINE_DOWN_WEAK_MAX_S:
+        last_lines = "\n".join(
+            [line for line in output.splitlines() if line.strip()][-ENGINE_DOWN_WEAK_TAIL_LINES:]
+        )
         for reason, pattern in ENGINE_DOWN_WEAK_PATTERNS:
-            if pattern.search(output):
+            if pattern.search(last_lines):
                 return reason
     return None
 
@@ -13243,7 +13279,7 @@ def build_parser() -> argparse.ArgumentParser:
     models_parser.add_argument("--invalidate", action="store_true", help="exclude selected model-log rows from evidence")
     models_parser.add_argument("--run", dest="invalidate_run_id", help="run_id selector for --invalidate")
     models_parser.add_argument("--task", dest="invalidate_task_key", help="task_key selector for --invalidate")
-    models_parser.add_argument("--reason", help="non-empty invalidation reason for --invalidate")
+    models_parser.add_argument("--reason", help="invalidation reason for --invalidate (at least 10 characters)")
     models_parser.add_argument("--cause", dest="invalidate_cause", choices=sorted(AMEND_EXCLUDING_CAUSES), help="amendment cause for --invalidate (default: infra)")
 
     amend_parser = subparsers.add_parser("amend", help="correct the record: exclude attempts the model did not cause")

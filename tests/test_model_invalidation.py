@@ -167,18 +167,42 @@ class ModelInvalidationTests(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertEqual([("b", "check")], [(e["task_key"], e["cause"]) for e in self.amendments()])
 
-    def test_invalidate_alias_skips_all_pass_tasks(self) -> None:
-        write_jsonl(self.log_path, [attempt("run-1", "a"), attempt("run-1", "b", verdict="FAIL")])
+    def test_invalidate_alias_excludes_whole_tasks_including_passes(self) -> None:
+        # A vacuous check made every task "pass", and an infra-broken run
+        # passed only on retry: invalidating either must remove the run from
+        # the scoreboard, not keep the passes and inflate the model's rates.
+        write_jsonl(
+            self.log_path,
+            [
+                attempt("good", "a", model="openrouter/acme/live", verdict="FAIL"),
+                attempt("vacuous", "a", model="openrouter/acme/live"),
+                attempt("vacuous", "b", model="openrouter/acme/live"),
+                attempt("flaky", "a", model="openrouter/acme/live", verdict="FAIL",
+                        logged_at="2026-07-06T10:00:00+00:00"),
+                attempt("flaky", "a", model="openrouter/acme/live",
+                        logged_at="2026-07-06T10:05:00+00:00"),
+            ],
+        )
 
-        rc, _out, err = self.invalidate(invalidate_run_id="run-1", reason="bad harness login")
+        for run in ("vacuous", "flaky"):
+            rc, _out, _err = self.invalidate(invalidate_run_id=run, invalidate_cause="check", reason="check was vacuous")
+            self.assertEqual(0, rc)
 
-        self.assertEqual(0, rc)
-        self.assertIn("a PASS cannot be amended", err)
-        self.assertEqual(["b"], [e["task_key"] for e in self.amendments()])
+        self.assertTrue(all(e.get("include_pass") is True for e in self.amendments()))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(0, run_models_command(self.config, self.model_args(json=True)))
+        groups = json.loads(out.getvalue())
+        self.assertEqual(1, sum(group["tasks"] for group in groups))
+        self.assertEqual(0.0, groups[0]["pass_rate"])
 
-        write_jsonl(self.log_path, [attempt("run-9", "a")])
-        rc, _out, _err = self.invalidate(invalidate_run_id="run-9", reason="bad harness login")
-        self.assertEqual(1, rc)
+    def test_amend_cli_still_refuses_pass_rows(self) -> None:
+        write_jsonl(self.log_path, [attempt("run-1", "a")])
+        entry = {"run_id": "run-1", "task_key": "a", "attempt": None, "cause": "check", "note": "check was vacuous"}
+        error, _numbers = ringer.validate_amendment_entry(entry, ringer.attempts_by_task_from_log(self.log_path))
+        self.assertIn("every attempt", error or "")
+        entry.update(include_pass=True, cause="worker")
+        error, _numbers = ringer.validate_amendment_entry(entry, ringer.attempts_by_task_from_log(self.log_path))
+        self.assertIn("cannot be combined", error or "")
 
     def test_cli_rejects_missing_inputs_and_reports_no_match(self) -> None:
         write_jsonl(self.log_path, [attempt("run-1", "a", verdict="FAIL")])

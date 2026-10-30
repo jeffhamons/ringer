@@ -26,7 +26,9 @@ from ringer import (  # noqa: E402
     aggregate_model_scoreboard_rows,
     detect_engine_down_reason,
     engine_down_scope,
+    worker_output_tail,
 )
+from ringer import WORKER_OUTPUT_TAIL_CHARS  # noqa: E402
 
 
 def toml_string(value: object) -> str:
@@ -78,13 +80,32 @@ class DetectEngineDownReasonTests(unittest.TestCase):
         self.assertEqual("payment_required", detect_engine_down_reason("status 402", duration_s=3.0))
         self.assertIsNone(detect_engine_down_reason("HTTP 401", duration_s=600.0))
         self.assertIsNone(detect_engine_down_reason("HTTP 401"))
+        self.assertEqual("unauthorized", detect_engine_down_reason("401 Unauthorized", duration_s=3.0))
+        for text in (
+            'File "/x/aider/main.py", line 401, in main',
+            "assert 200 == 401",
+            "Django model Foo not found",
+            "error: HTTP 401\n" + "\n".join(f"step {n} ok" for n in range(10)),
+        ):
+            with self.subTest(text):
+                self.assertIsNone(detect_engine_down_reason(text, duration_s=3.0))
+
+    def test_output_tail_redacts_before_cutting(self) -> None:
+        key = "sk-ant-api03-" + "A" * 90
+        for pad in range(0, 120, 7):
+            output = "x " * 50 + key + " " + "y" * (WORKER_OUTPUT_TAIL_CHARS - 40 - pad) + "\nend"
+            with self.subTest(pad=pad):
+                tail = worker_output_tail(output)
+                self.assertNotIn("A" * 20, tail)
+                self.assertLessEqual(len(tail), WORKER_OUTPUT_TAIL_CHARS)
+        self.assertEqual("plain output", worker_output_tail("\x1b[31mplain output"))
 
     def test_model_unavailable_is_scoped_to_the_model(self) -> None:
         reason = detect_engine_down_reason('{"error":{"code":"model_not_found"}}')
         self.assertEqual("model_unavailable", reason)
         self.assertEqual("model", engine_down_scope(reason))
         self.assertEqual("model_unavailable", detect_engine_down_reason("No endpoints found for acme/gone"))
-        self.assertEqual("model_unavailable", detect_engine_down_reason("404: model foo not found", duration_s=1.0))
+        self.assertEqual("model_unavailable", detect_engine_down_reason("HTTP 404: model foo not found", duration_s=1.0))
         self.assertEqual("engine", engine_down_scope("http_402"))
 
     def test_ignores_ordinary_worker_output(self) -> None:
