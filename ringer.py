@@ -3765,7 +3765,18 @@ _EXPIRY_PATH_CHAR = r"(?![A-Za-z0-9._-])"
 # Plumbing-safe diff flags: a user's diff.external, textconv, color or
 # noprefix settings must never turn the archived patch into display output.
 _EXPIRY_DIFF_FLAGS = ["-p", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"]
-_EXPIRY_IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG")
+_EXPIRY_IN_PROGRESS = (
+    "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG", "sequencer"
+)
+# Repo-selecting variables a parent may export (git hooks export GIT_DIR and
+# GIT_INDEX_FILE): inherited, they would point every command at the wrong repo
+# and pin the wrong HEAD. `git rev-parse --local-env-vars` plus gh's override.
+_EXPIRY_SCRUB_ENV = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR", "GH_REPO",
+)
 
 
 def default_scheduler_paths() -> list[Path]:
@@ -3797,7 +3808,10 @@ def _expiry_sh(
             input=input,
             capture_output=True,
             timeout=timeout,
-            env={**os.environ, **env} if env else None,
+            env={
+                **{k: v for k, v in os.environ.items() if k not in _EXPIRY_SCRUB_ENV},
+                **(env or {}),
+            },
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, b"", str(exc).encode()
@@ -3954,8 +3968,12 @@ def _scheduler_entries(
             continue
         if base.is_dir():
             files = []
-            for root, _dirs, names in os.walk(base, onerror=walk_error, followlinks=False):
+            for root, dirs, names in os.walk(base, onerror=walk_error, followlinks=False):
                 files.extend(os.path.join(root, name) for name in names)
+                for name in dirs:
+                    linked = os.path.join(root, name)
+                    if os.path.islink(linked):  # not walked; its target may sit inside a tree
+                        entries.append((linked, "", os.path.realpath(linked)))
             files.sort()
         else:
             files = [str(base)]
@@ -3997,22 +4015,51 @@ class _OpenPaths:
         return self.paths
 
 
-def _gh_open_pr_branches(repo: str) -> set[str] | None:
-    """Head branch names of the repo's open PRs, or None when that cannot be known."""
-    rc, out, _ = _expiry_sh(
-        ["gh", "pr", "list", "--state", "open", "--limit", str(WORKTREE_EXPIRY_PR_LIMIT), "--json", "headRefName"],
-        cwd=Path(repo),
-        timeout=120,
-    )
+def _github_remotes(repo: str) -> set[str] | None:
+    """owner/name of every GitHub remote of the repo."""
+    rc, out, _ = _expiry_sh(["git", "-C", repo, "remote", "-v"], timeout=60)
     if rc != 0:
         return None
-    try:
-        prs = json.loads(out)
-    except json.JSONDecodeError:
+    found: set[str] = set()
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        match = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?(?:\s|$)", line)
+        if match:
+            found.add(f"{match.group(1)}/{match.group(2)}")
+    return found
+
+
+def _gh_open_prs(repo: str) -> tuple[set[str], set[str]] | None:
+    """(head branch names, head SHAs) of open PRs on every GitHub remote, or None if unknowable.
+
+    Every remote, not gh's default: a fork's PRs are invisible from upstream.
+    """
+    remotes = _github_remotes(repo)
+    if remotes is None:
         return None
-    if not isinstance(prs, list) or len(prs) >= WORKTREE_EXPIRY_PR_LIMIT:
-        return None  # possibly truncated: cannot prove a branch has no open PR
-    return {str(pr.get("headRefName")) for pr in prs if isinstance(pr, dict)}
+    names: set[str] = set()
+    oids: set[str] = set()
+    for remote in sorted(remotes):
+        rc, out, _ = _expiry_sh(
+            [
+                "gh", "pr", "list", "--repo", remote, "--state", "open",
+                "--limit", str(WORKTREE_EXPIRY_PR_LIMIT), "--json", "headRefName,headRefOid",
+            ],
+            cwd=Path(repo),
+            timeout=120,
+        )
+        if rc != 0:
+            return None
+        try:
+            prs = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(prs, list) or len(prs) >= WORKTREE_EXPIRY_PR_LIMIT:
+            return None  # possibly truncated: cannot prove a branch has no open PR
+        for pr in prs:
+            if isinstance(pr, dict):
+                names.add(str(pr.get("headRefName")))
+                oids.add(str(pr.get("headRefOid")))
+    return names, oids
 
 
 def _active_run_workdirs() -> dict[str, str]:
@@ -4127,6 +4174,9 @@ def _worktree_hazard(tree: Path) -> str | None:
             return f"git operation in progress ({name})"
     if (git_dir / "modules").exists():
         return "has submodules"
+    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "ls-files", "-u"])
+    if rc != 0 or out.strip():
+        return "unmerged index entries (conflict)"
     rc, out, _ = _expiry_sh(["git", "-C", str(tree), "ls-files", "-s", "-z"])
     if rc != 0:
         return "cannot list index"
@@ -4190,12 +4240,14 @@ def _archive_worktree(
     rc, tracked, _ = git("diff-index", *_EXPIRY_DIFF_FLAGS, "HEAD")
     need(rc == 0, "diff-index HEAD")
     (archive / "tracked.patch").write_bytes(tracked)
-    rc, staged, _ = git("diff-index", "--cached", *_EXPIRY_DIFF_FLAGS, "HEAD")
+    # write-tree skips intent-to-add entries, so the patch must too.
+    rc, staged, _ = git("diff-index", "--cached", "--ita-invisible-in-index", *_EXPIRY_DIFF_FLAGS, "HEAD")
     need(rc == 0, "diff-index --cached HEAD")
     (archive / "staged.patch").write_bytes(staged)
 
     # Prove both patches rebuild what is on disk / in the index, using
-    # throwaway index files so the tree's own index is never touched.
+    # throwaway index files (only the --refresh above touches the real index,
+    # and only its stat data).
     rc, out, _ = git("rev-parse", "--path-format=absolute", "--git-path", "index")
     real_index = Path(out.decode("utf-8", errors="surrogateescape").strip()) if rc == 0 else None
     with tempfile.TemporaryDirectory(prefix="ringer-expiry-") as scratch:
@@ -4300,8 +4352,8 @@ def _archive_worktree(
         "tracked_patch_sha256": hashlib.sha256(tracked).hexdigest(),
         "pinned_commits": dict(created_refs),
         "restore": (
-            "git worktree add --detach <dir> <head>; in <dir>: git apply tracked.patch (working tree), "
-            "git apply --cached staged.patch (index); tar -xzf untracked.tar.gz and ignored.tar.gz into <dir>; "
+            "git worktree add --detach <dir> <head>; in <dir>: git apply --whitespace=nowarn tracked.patch "
+            "(working tree), git apply --cached --whitespace=nowarn staged.patch (index); tar -xzf untracked.tar.gz and ignored.tar.gz into <dir>; "
             "pinned commits: git -C <repo> for-each-ref refs/archive/ (or git fetch commits.bundle)"
         ),
     }
@@ -4324,15 +4376,15 @@ def expire_worktrees(
     now: float | None = None,
     scheduler_paths: list[Path] | None = None,
     crontab_text: str | None = None,
-    open_pr_branches: Any = None,
+    open_prs: Any = None,
     log: Any = print,
 ) -> list[dict[str, Any]]:
     """Archive and remove idle worktrees in scope; returns one result per candidate.
 
     action: would-expire (dry run), expired, keep (a safety gate held it, see
     reason) or fail (an archive step failed, so it was not removed).
-    `open_pr_branches(repo)` returns the head branches of open PRs, or None
-    when that cannot be known; it defaults to `gh pr list`.
+    `open_prs(repo)` returns (head branch names, head SHAs) of open PRs, or
+    None when that cannot be known; it defaults to `gh pr list` per remote.
     """
     import fcntl
 
@@ -4357,7 +4409,7 @@ def expire_worktrees(
             now=time.time() if now is None else now,
             scheduler_paths=default_scheduler_paths() if scheduler_paths is None else scheduler_paths,
             crontab_text=crontab_text,
-            open_pr_branches=open_pr_branches or _gh_open_pr_branches,
+            open_prs=open_prs or _gh_open_prs,
             log=log,
         )
     finally:
@@ -4373,13 +4425,13 @@ def _expire_worktrees_locked(
     now: float,
     scheduler_paths: list[Path],
     crontab_text: str | None,
-    open_pr_branches: Any,
+    open_prs: Any,
     log: Any,
 ) -> list[dict[str, Any]]:
     candidates, registered = _expiry_candidates(state_dir, config)
     open_paths = _OpenPaths()
     scheduler: list[tuple[str, str, str]] | None = None
-    pr_branches: dict[str, set[str] | None] = {}
+    pr_state: dict[str, tuple[set[str], set[str]] | None] = {}
     stamp_date = datetime.now().strftime("%Y%m%d")
     home = str(Path.home())
     results: list[dict[str, Any]] = []
@@ -4444,16 +4496,25 @@ def _expire_worktrees_locked(
             if source:
                 result["reason"] = f"referenced by scheduler {source}"
                 continue
-            if cand.get("branch"):
-                repo_key = str(cand["repo"])
-                if repo_key not in pr_branches:
-                    pr_branches[repo_key] = open_pr_branches(repo_key)
-                branches = pr_branches[repo_key]
-                if branches is None:
-                    result["reason"] = f"cannot check open PRs for branch {cand['branch']}"
-                    continue
-                if cand["branch"] in branches:
-                    result["reason"] = f"open PR on branch {cand['branch']}"
+            repo_key = str(cand["repo"])
+            if repo_key not in pr_state:
+                pr_state[repo_key] = open_prs(repo_key)
+            prs = pr_state[repo_key]
+            if prs is None and cand.get("branch"):
+                result["reason"] = f"cannot check open PRs for branch {cand['branch']}"
+                continue
+            if prs is not None:
+                pr_names, pr_oids = prs
+                names = {cand["branch"]} if cand.get("branch") else set()
+                if cand.get("branch"):
+                    rc, out, _ = _expiry_sh(
+                        ["git", "-C", path, "rev-parse", "--abbrev-ref", f"{cand['branch']}@{{upstream}}"], timeout=60
+                    )
+                    if rc == 0 and b"/" in out:
+                        names.add(out.decode().strip().split("/", 1)[1])
+                hit = next(iter(sorted(names & pr_names)), None)
+                if hit or (cand.get("head") and cand["head"] in pr_oids):
+                    result["reason"] = f"open PR on {hit or 'HEAD ' + str(cand['head'])[:12]}"
                     continue
             hazard = _worktree_hazard(Path(path))
             if hazard:
@@ -4470,14 +4531,16 @@ def _expire_worktrees_locked(
             created_refs: dict[str, str] = {}
             try:
                 problems = _archive_worktree(cand, archive, stamp_date, idle_days, created_refs)
-            except Exception as exc:
-                problems = [f"error: {exc}"]
-            if not problems and _worktree_activity(Path(path))[0] > newest:
-                problems.append("tree written during archive")
-            if not problems and is_open(real, path, refresh=True):
-                problems.append("tree opened during archive")
-            if not problems and active_holder(real):
-                problems.append("an active run started using it during archive")
+                if not problems and _worktree_activity(Path(path))[0] > newest:
+                    problems.append("tree written during archive")
+                if not problems and is_open(real, path, refresh=True):
+                    problems.append("tree opened during archive")
+                if not problems and active_holder(real):
+                    problems.append("an active run started using it during archive")
+            except BaseException:
+                _undo_archive(str(cand["repo"]), archive, created_refs)
+                result["archive"] = None
+                raise
             if problems:
                 _undo_archive(str(cand["repo"]), archive, created_refs)
                 result.update(action="fail", reason="; ".join(problems), archive=None)

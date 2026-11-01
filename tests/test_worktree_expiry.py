@@ -99,7 +99,7 @@ class WorktreeExpiryTests(unittest.TestCase):
             scheduler_paths=[self.scheduler_dir],
             crontab_text="",
             log=lines.append,
-            **{"open_pr_branches": lambda repo: set(), **kwargs},
+            **{"open_prs": lambda repo: (set(), set()), **kwargs},
         )
         return {r["path"]: r for r in results}, lines
 
@@ -353,16 +353,81 @@ class WorktreeExpiryTests(unittest.TestCase):
         plain = self.add_worktree(self.base / "wts" / "job-nopr", branch="feature/merged", record=False)
         age_tree(wt, 10 * DAY)
         age_tree(plain, 10 * DAY)
-        results, _ = self.expire(config=self.adopt(), open_pr_branches=lambda repo: {"feature/pr-open"})
+        results, _ = self.expire(config=self.adopt(), open_prs=lambda repo: ({"feature/pr-open"}, set()))
         self.assertEqual(results[str(wt)]["action"], "keep")
         self.assertIn("open PR", results[str(wt)]["reason"])
         self.assertEqual(results[str(plain)]["action"], "expired")
         # Unknown PR state keeps branch trees; detached trees don't need it.
         detached = self.add_worktree(self.base / "wts" / "job-det")
         age_tree(detached, 10 * DAY)
-        results, _ = self.expire(config=self.adopt(), open_pr_branches=lambda repo: None)
+        results, _ = self.expire(config=self.adopt(), open_prs=lambda repo: None)
         self.assertIn("cannot check open PRs", results[str(wt)]["reason"])
         self.assertEqual(results[str(detached)]["action"], "expired")
+
+    def test_pr_matched_by_upstream_name_or_head_sha(self) -> None:
+        tracking = self.add_worktree(self.base / "wts" / "job-up", branch="local-name", record=False)
+        git("branch", "--set-upstream-to=origin/main", cwd=tracking)
+        detached = self.add_worktree(self.base / "wts" / "job-sha")
+        (detached / "tracked.txt").write_text("pr head\n")
+        git("commit", "-q", "-am", "pr head", cwd=detached)
+        head = git("rev-parse", "HEAD", cwd=detached)
+        age_tree(tracking, 10 * DAY)
+        age_tree(detached, 10 * DAY)
+        results, _ = self.expire(dry_run=True, config=self.adopt(), open_prs=lambda repo: ({"main"}, {head}))
+        self.assertIn("open PR", results[str(tracking)]["reason"])
+        self.assertIn("open PR", results[str(detached)]["reason"])
+
+    def test_github_remotes_parsed(self) -> None:
+        git("remote", "add", "fork", "git@github.com:me/thing.git", cwd=self.repo)
+        git("remote", "add", "up", "https://github.com/Org/thing", cwd=self.repo)
+        self.assertEqual(ringer._github_remotes(str(self.repo)), {"me/thing", "Org/thing"})
+
+    def test_inherited_git_dir_does_not_misdirect(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-env")
+        (wt / "tracked.txt").write_text("unique\n")
+        git("commit", "-q", "-am", "unique", cwd=wt)
+        unique = git("rev-parse", "HEAD", cwd=wt)
+        age_tree(wt, 10 * DAY)
+        os.environ["GIT_DIR"] = str(self.repo / ".git")
+        os.environ["GIT_INDEX_FILE"] = str(self.repo / ".git" / "index")
+        try:
+            results, _ = self.expire()
+        finally:
+            os.environ.pop("GIT_DIR")
+            os.environ.pop("GIT_INDEX_FILE")
+        self.assertEqual(results[str(wt)]["action"], "expired", results[str(wt)])
+        self.assertIn(unique, self.refs())
+
+    def test_intent_to_add_expires(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-ita")
+        (wt / "later.txt").write_text("not staged yet\n")
+        git("add", "-N", "later.txt", cwd=wt)
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire()
+        self.assertEqual(results[str(wt)]["action"], "expired", results[str(wt)])
+
+    def test_unmerged_and_sequencer_are_kept(self) -> None:
+        seq = self.add_worktree(self.base / "wts" / "job-seq")
+        (Path(git("rev-parse", "--absolute-git-dir", cwd=seq)) / "sequencer").mkdir()
+        conflict = self.add_worktree(self.base / "wts" / "job-conflict")
+        blob = git("hash-object", "-w", "tracked.txt", cwd=conflict)
+        subprocess.run(
+            ["git", "update-index", "--index-info"], cwd=conflict, check=True,
+            input=f"0 {'0' * 40}\ttracked.txt\n100644 {blob} 1\ttracked.txt\n100644 {blob} 2\ttracked.txt\n".encode(),
+        )
+        age_tree(seq, 10 * DAY)
+        age_tree(conflict, 10 * DAY)
+        results, _ = self.expire()
+        self.assertIn("sequencer", results[str(seq)]["reason"])
+        self.assertIn("unmerged", results[str(conflict)]["reason"])
+
+    def test_symlinked_scheduler_dir_into_tree_is_kept(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-sdir")
+        (wt / "tasks" / "job").mkdir(parents=True)
+        (self.scheduler_dir / "job").symlink_to(wt / "tasks" / "job")
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire(dry_run=True)
+        self.assertIn("scheduler", results[str(wt)]["reason"])
 
     def test_scheduler_file_inside_tree_is_kept(self) -> None:
         wt = self.add_worktree(self.base / "wts" / "job-link")
