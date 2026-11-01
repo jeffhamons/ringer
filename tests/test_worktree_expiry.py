@@ -99,9 +99,15 @@ class WorktreeExpiryTests(unittest.TestCase):
             scheduler_paths=[self.scheduler_dir],
             crontab_text="",
             log=lines.append,
-            **kwargs,
+            **{"open_pr_branches": lambda repo: set(), **kwargs},
         )
         return {r["path"]: r for r in results}, lines
+
+    def adopt(self) -> WorktreeExpiryConfig:
+        return WorktreeExpiryConfig(repos=(self.repo,), roots=(self.base / "wts",))
+
+    def refs(self) -> str:
+        return git("-C", str(self.repo), "for-each-ref", "refs/archive")
 
     def make_dirty(self, wt: Path) -> None:
         (wt / "tracked.txt").write_text("two\n")
@@ -129,10 +135,14 @@ class WorktreeExpiryTests(unittest.TestCase):
         self.assertTrue(any("would-expire" in line for line in lines))
 
     def test_expire_archives_everything_then_removes(self) -> None:
-        wt = self.add_worktree(self.base / "wts" / "job-b", branch="feature/keep-me")
+        wt = self.add_worktree(self.base / "wts" / "job-b", branch="feature/keep-me", record=False)
         self.make_dirty(wt)
+        # Display-oriented diff settings must not leak into the archived patch.
+        git("config", "diff.external", "/bin/echo", cwd=self.repo)
+        git("config", "color.ui", "always", cwd=self.repo)
+        git("config", "diff.noprefix", "true", cwd=self.repo)
         age_tree(wt, 10 * DAY)
-        results, _ = self.expire()
+        results, _ = self.expire(config=self.adopt())
         result = results[str(wt)]
         self.assertEqual(result["action"], "expired", result)
         self.assertFalse(wt.exists())
@@ -153,13 +163,13 @@ class WorktreeExpiryTests(unittest.TestCase):
         self.assertEqual(meta["path"], str(wt))
         self.assertEqual(meta["branch"], "feature/keep-me")
         self.assertEqual(meta["head"], git("-C", str(self.repo), "rev-parse", "feature/keep-me"))
-        self.assertTrue(meta["run_id"].startswith("job-2026T"))
-        self.assertEqual(meta["task"], "job-b")
+        self.assertEqual(meta["source"], "adopted")
         # The tracked patch restores the change onto a fresh checkout.
         restore = self.base / "restore"
         git("-C", str(self.repo), "worktree", "add", "-q", str(restore), meta["head"])
         git("apply", str(archive / "tracked.patch"), cwd=restore)
         self.assertEqual((restore / "tracked.txt").read_text(), "two\n")
+        self.assertEqual((restore / "staged.txt").read_text(), "staged change\n")
         self.assertIn(str(wt), (archive.parent / "INDEX.md").read_text())
 
     def test_reflog_only_commits_are_pinned_and_bundled(self) -> None:
@@ -188,6 +198,15 @@ class WorktreeExpiryTests(unittest.TestCase):
         meta = json.loads((self.archive_dir(result) / "meta.json").read_text())
         self.assertEqual(sorted(meta["pinned_commits"].values()), sorted([lost, head]))
 
+    def test_per_worktree_ref_commits_are_pinned(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-wref")
+        orphan = git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "only on refs/worktree", cwd=wt)
+        git("update-ref", "refs/worktree/keep", orphan, cwd=wt)
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire()
+        self.assertEqual(results[str(wt)]["action"], "expired", results[str(wt)])
+        self.assertIn(orphan, self.refs())
+
     def test_dot_prefixed_path(self) -> None:
         wt = self.add_worktree(self.base / ".ringer" / "jobs" / ".hidden-job" / "task")
         (wt / "tracked.txt").write_text("dot\n")
@@ -197,6 +216,9 @@ class WorktreeExpiryTests(unittest.TestCase):
         result = results[str(wt)]
         self.assertEqual(result["action"], "expired", result)
         self.assertTrue(self.archive_dir(result).name.startswith("t-"))
+        meta = json.loads((self.archive_dir(result) / "meta.json").read_text())
+        self.assertEqual(meta["task"], "task")
+        self.assertTrue(meta["run_id"].startswith("job-2026T"))
         refs = git("-C", str(self.repo), "for-each-ref", "--format=%(refname)", "refs/archive")
         self.assertTrue(refs)
         for ref in refs.splitlines():
@@ -277,6 +299,101 @@ class WorktreeExpiryTests(unittest.TestCase):
         results, _ = self.expire(dry_run=True)
         self.assertEqual(results[str(other)]["action"], "would-expire")
 
+    def test_branch_checkout_at_recorded_path_is_not_ringers(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "hand-made", branch="topic/hand")
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire(dry_run=True)
+        self.assertNotIn(str(wt), results)
+
+    def test_staged_then_deleted_file_expires(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-ad")
+        (wt / "gone.txt").write_text("x\n")
+        git("add", "gone.txt", cwd=wt)
+        (wt / "gone.txt").unlink()
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire()
+        self.assertEqual(results[str(wt)]["action"], "expired", results[str(wt)])
+
+    def test_skip_worktree_edit_is_kept(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-sw")
+        git("update-index", "--skip-worktree", "tracked.txt", cwd=wt)
+        (wt / "tracked.txt").write_text("hidden edit\n")
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire()
+        self.assertEqual(results[str(wt)]["action"], "keep")
+        self.assertIn("skip-worktree", results[str(wt)]["reason"])
+
+    def test_submodules_and_operations_in_progress_are_kept(self) -> None:
+        sub = self.add_worktree(self.base / "wts" / "job-sub")
+        merging = self.add_worktree(self.base / "wts" / "job-merge")
+        for wt, name in ((sub, "modules"), (merging, "MERGE_HEAD")):
+            git_dir = Path(git("rev-parse", "--absolute-git-dir", cwd=wt))
+            if name == "modules":
+                (git_dir / name).mkdir()
+            else:
+                (git_dir / name).write_text(git("rev-parse", "HEAD", cwd=wt) + "\n")
+            age_tree(wt, 10 * DAY)
+        results, _ = self.expire()
+        self.assertEqual(results[str(sub)]["action"], "keep")
+        self.assertIn("submodule", results[str(sub)]["reason"])
+        self.assertEqual(results[str(merging)]["action"], "keep")
+        self.assertIn("MERGE_HEAD", results[str(merging)]["reason"])
+
+    def test_big_ignored_file_is_kept(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-big")
+        (wt / "out.log").write_text("x" * 100)
+        age_tree(wt, 10 * DAY)
+        with mock.patch.object(ringer, "WORKTREE_EXPIRY_BIG_IGNORED_BYTES", 50):
+            results, _ = self.expire()
+        self.assertEqual(results[str(wt)]["action"], "keep")
+        self.assertIn("out.log", results[str(wt)]["reason"])
+
+    def test_open_pr_branch_is_kept(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-pr", branch="feature/pr-open", record=False)
+        plain = self.add_worktree(self.base / "wts" / "job-nopr", branch="feature/merged", record=False)
+        age_tree(wt, 10 * DAY)
+        age_tree(plain, 10 * DAY)
+        results, _ = self.expire(config=self.adopt(), open_pr_branches=lambda repo: {"feature/pr-open"})
+        self.assertEqual(results[str(wt)]["action"], "keep")
+        self.assertIn("open PR", results[str(wt)]["reason"])
+        self.assertEqual(results[str(plain)]["action"], "expired")
+        # Unknown PR state keeps branch trees; detached trees don't need it.
+        detached = self.add_worktree(self.base / "wts" / "job-det")
+        age_tree(detached, 10 * DAY)
+        results, _ = self.expire(config=self.adopt(), open_pr_branches=lambda repo: None)
+        self.assertIn("cannot check open PRs", results[str(wt)]["reason"])
+        self.assertEqual(results[str(detached)]["action"], "expired")
+
+    def test_scheduler_file_inside_tree_is_kept(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-link")
+        (wt / "agent.plist").write_text("<plist/>")
+        (self.scheduler_dir / "com.example.agent.plist").symlink_to(wt / "agent.plist")
+        age_tree(wt, 10 * DAY)
+        results, _ = self.expire(dry_run=True)
+        self.assertEqual(results[str(wt)]["action"], "keep")
+        self.assertIn("scheduler", results[str(wt)]["reason"])
+
+    def test_reused_path_keeps_earlier_archive(self) -> None:
+        wt = self.add_worktree(self.base / "wts" / "job-re")
+        age_tree(wt, 10 * DAY)
+        first, _ = self.expire()
+        first_archive = Path(first[str(wt)]["archive"])
+        self.add_worktree(wt)
+        age_tree(wt, 10 * DAY)
+        second, _ = self.expire()
+        second_archive = Path(second[str(wt)]["archive"])
+        self.assertEqual(second[str(wt)]["action"], "expired")
+        self.assertNotEqual(first_archive, second_archive)
+        self.assertTrue((first_archive / "meta.json").exists())
+
+    def test_dry_run_does_not_rewrite_active_runs(self) -> None:
+        path = ringer.active_runs_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"dead": {"pid": 999999, "workdir": "/x"}}))
+        before = path.read_text()
+        self.expire(dry_run=True)
+        self.assertEqual(path.read_text(), before)
+
     def test_unreadable_scheduler_file(self) -> None:
         wt = self.add_worktree(self.base / "wts" / "job-o")
         age_tree(wt, 10 * DAY)
@@ -321,6 +438,9 @@ class WorktreeExpiryTests(unittest.TestCase):
             results, _ = self.expire()
         self.assertEqual(results[str(wt)]["action"], "fail")
         self.assertTrue(wt.exists())
+        # A failed attempt leaves no archive or pins behind to pile up daily.
+        self.assertEqual(list((self.state_dir / "patches").rglob("*.patch")), [])
+        self.assertEqual(self.refs(), "")
 
     def test_fails_closed_when_bundle_verify_fails(self) -> None:
         wt = self.add_worktree(self.base / "wts" / "job-l")
@@ -339,6 +459,7 @@ class WorktreeExpiryTests(unittest.TestCase):
         self.assertEqual(results[str(wt)]["action"], "fail")
         self.assertIn("bundle", results[str(wt)]["reason"])
         self.assertTrue(wt.exists())
+        self.assertEqual(self.refs(), "")
 
     def test_tree_written_during_archive_is_not_removed(self) -> None:
         wt = self.add_worktree(self.base / "wts" / "job-m")
@@ -346,7 +467,7 @@ class WorktreeExpiryTests(unittest.TestCase):
         real = ringer._expiry_sh
 
         def touching(args, **kwargs):
-            if args[:2] == ["git", "-C"] and "diff" in args:
+            if args[:2] == ["git", "-C"] and "diff-index" in args:
                 (wt / "late.txt").write_text("written mid-archive\n")
             return real(args, **kwargs)
 
@@ -385,6 +506,10 @@ class WorktreeExpiryConfigTests(unittest.TestCase):
             load_worktree_expiry_config({"idle_days": 0})
         with self.assertRaises(ValueError):
             load_worktree_expiry_config({"repos": "~/r"})
+        with self.assertRaises(ValueError):
+            load_worktree_expiry_config({"idle_days": float("nan")})
+        with self.assertRaises(ValueError):
+            load_worktree_expiry_config({"auto": "false"})
 
 
 class WorktreeExpiryAutoStartTests(unittest.TestCase):

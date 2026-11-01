@@ -1231,8 +1231,11 @@ def load_worktree_expiry_config(raw: Any) -> WorktreeExpiryConfig:
     if not isinstance(raw, dict):
         raise ValueError("worktree_expiry must be a TOML table")
     idle_days = float(raw.get("idle_days", 7.0))
-    if idle_days <= 0:
-        raise ValueError("worktree_expiry.idle_days must be positive")
+    if not math.isfinite(idle_days) or idle_days <= 0:
+        raise ValueError("worktree_expiry.idle_days must be a positive number")
+    auto = raw.get("auto", True)
+    if not isinstance(auto, bool):
+        raise ValueError("worktree_expiry.auto must be true or false")
 
     def paths(key: str) -> tuple[Path, ...]:
         value = raw.get(key, [])
@@ -1244,7 +1247,7 @@ def load_worktree_expiry_config(raw: Any) -> WorktreeExpiryConfig:
         idle_days=idle_days,
         repos=paths("repos"),
         roots=paths("roots"),
-        auto=bool(raw.get("auto", True)),
+        auto=auto,
     )
 
 
@@ -3737,15 +3740,19 @@ def unregister_active_run(run_id: str) -> None:
 # Worktree expiry. Failed tasks keep their worktrees for post-mortems (see
 # _prepare_taskdir) and nothing ever removed them, so they piled up by the
 # hundred. This pass archives an idle worktree completely -- tracked and staged
-# diffs, untracked and non-cache ignored files, and every commit that only its
-# HEAD or HEAD reflog reaches -- and removes it only when every archive step
-# verified. `git worktree remove` deletes the per-worktree reflog, so those
-# commits are pinned under refs/archive/ in the repo and bundled first.
+# diffs (verified by re-applying them), untracked and non-cache ignored files,
+# and every commit that only its HEAD, HEAD reflog or per-worktree refs reach --
+# and removes it only when every archive step verified. `git worktree remove`
+# deletes the per-worktree reflog, so those commits are pinned under
+# refs/archive/ in the repo and bundled first. Trees holding state the archive
+# cannot capture (submodules, skip-worktree files, an operation in progress,
+# huge ignored files) are kept, never half-archived.
 WORKTREE_EXPIRY_STAMP = "worktree-expiry.stamp"
 WORKTREE_EXPIRY_LOG = "worktree-expiry.log"
 WORKTREE_EXPIRY_LOCK = "worktree-expiry.lock"
 WORKTREE_EXPIRY_AUTO_INTERVAL_S = 24 * 3600
 WORKTREE_EXPIRY_BIG_IGNORED_BYTES = 50_000_000
+WORKTREE_EXPIRY_PR_LIMIT = 1000
 _EXPIRY_CACHE_DIRS = frozenset(
     {"__pycache__", ".pytest_cache", ".venv", "venv", "node_modules", ".ruff_cache", ".mypy_cache", ".hypothesis", ".tox"}
 )
@@ -3755,6 +3762,10 @@ _EXPIRY_CACHE_RE = re.compile(
 )
 # A path char after a needle means a different, longer path (job-1 vs job-10).
 _EXPIRY_PATH_CHAR = r"(?![A-Za-z0-9._-])"
+# Plumbing-safe diff flags: a user's diff.external, textconv, color or
+# noprefix settings must never turn the archived patch into display output.
+_EXPIRY_DIFF_FLAGS = ["-p", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"]
+_EXPIRY_IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG")
 
 
 def default_scheduler_paths() -> list[Path]:
@@ -3772,30 +3783,52 @@ class WorktreeExpiryAbort(RuntimeError):
 
 
 def _expiry_sh(
-    args: list[str], *, cwd: Path | None = None, input: bytes | None = None, timeout: float = 600
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    input: bytes | None = None,
+    timeout: float = 600,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, bytes, bytes]:
     try:
-        result = subprocess.run(args, cwd=cwd, input=input, capture_output=True, timeout=timeout)
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            input=input,
+            capture_output=True,
+            timeout=timeout,
+            env={**os.environ, **env} if env else None,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, b"", str(exc).encode()
     return result.returncode, result.stdout, result.stderr
+
+
+def _walk_files(top: bytes | str) -> Iterable[Any]:
+    """Files under `top`, cache dirs pruned; symlinks to dirs count as files (not followed)."""
+    for root, dirs, files in os.walk(top):
+        links = [d for d in dirs if os.path.islink(os.path.join(root, d))]
+        dirs[:] = [
+            d for d in dirs
+            if d not in links and os.fsdecode(d) not in _EXPIRY_CACHE_DIRS and not os.fsdecode(d).endswith(".egg-info")
+        ]
+        for name in [*files, *links]:
+            yield os.path.join(root, name)
 
 
 def _worktree_activity(path: Path) -> tuple[float, int]:
     """Newest mtime and total size of the tree's files, caches and venvs excluded."""
     newest = 0.0
     size = 0
-    for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in _EXPIRY_CACHE_DIRS and not d.endswith(".egg-info")]
-        for name in files:
-            if name.endswith(".pyc") or name == ".DS_Store":
-                continue
-            try:
-                st = os.lstat(os.path.join(root, name))
-            except OSError:
-                continue
-            newest = max(newest, st.st_mtime)
-            size += st.st_size
+    for file_path in _walk_files(str(path)):
+        if file_path.endswith(".pyc") or file_path.endswith("/.DS_Store"):
+            continue
+        try:
+            st = os.lstat(file_path)
+        except OSError:
+            continue
+        newest = max(newest, st.st_mtime)
+        size += st.st_size
     if newest == 0.0:
         with contextlib.suppress(OSError):
             newest = os.lstat(path).st_mtime
@@ -3832,9 +3865,13 @@ def _git_common_dir(path: Path) -> Path | None:
     return Path(os.path.realpath(out.decode("utf-8", errors="surrogateescape").strip()))
 
 
-def _run_record_taskdirs(state_dir: Path) -> dict[str, dict[str, str]]:
-    """realpath(taskdir) -> {run_id, task} from every run record Ringer kept."""
-    found: dict[str, dict[str, str]] = {}
+def _run_record_taskdirs(state_dir: Path) -> dict[str, dict[str, Any]]:
+    """realpath(taskdir) -> {run_id, run_ids, task} from every run record Ringer kept.
+
+    run_id prefers a record whose task had no setup_error: a re-run that failed
+    with "taskdir already exists" did not create the tree.
+    """
+    found: dict[str, dict[str, Any]] = {}
     for record in sorted((state_dir / "runs").glob("*.json")):
         try:
             data = json.loads(record.read_text(encoding="utf-8"))
@@ -3843,13 +3880,19 @@ def _run_record_taskdirs(state_dir: Path) -> dict[str, dict[str, str]]:
         tasks = data.get("tasks") if isinstance(data, dict) else None
         if not isinstance(tasks, list):
             continue
+        run_id = str(data.get("run_id") or record.stem)
         for task in tasks:
             taskdir = task.get("taskdir") if isinstance(task, dict) else None
-            if isinstance(taskdir, str) and taskdir:
-                found[os.path.realpath(taskdir)] = {
-                    "run_id": str(data.get("run_id") or record.stem),
-                    "task": str(task.get("key") or ""),
-                }
+            if not (isinstance(taskdir, str) and taskdir):
+                continue
+            entry = found.setdefault(os.path.realpath(taskdir), {"run_id": None, "run_ids": [], "task": ""})
+            entry["run_ids"].append(run_id)
+            if entry["run_id"] is None and not task.get("setup_error"):
+                entry["run_id"] = run_id
+                entry["task"] = str(task.get("key") or "")
+    for entry in found.values():
+        if entry["run_id"] is None:
+            entry["run_id"] = entry["run_ids"][0]
     return found
 
 
@@ -3868,18 +3911,19 @@ def _expiry_slug(path: Path) -> str:
     return f"t-{readable}-{digest}"
 
 
-def _scheduler_texts(
+def _scheduler_entries(
     scheduler_paths: list[Path], crontab_text: str | None, log: Any = print
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
+    """(source, text, realpath of the file) for crontab and every scheduler file."""
     import plistlib
 
-    texts: list[tuple[str, str]] = []
+    entries: list[tuple[str, str, str]] = []
     if crontab_text is None:
         rc, out, err = _expiry_sh(["crontab", "-l"], timeout=60)
         if rc != 0 and b"no crontab" not in err.lower():
             raise WorktreeExpiryAbort(f"crontab -l failed: {err.decode(errors='replace').strip()}")
         crontab_text = out.decode("utf-8", errors="replace") if rc == 0 else ""
-    texts.append(("crontab", crontab_text))
+    entries.append(("crontab", crontab_text, ""))
 
     def strings(obj: Any) -> Iterable[str]:
         if isinstance(obj, dict):
@@ -3892,30 +3936,43 @@ def _scheduler_texts(
         else:
             yield str(obj)
 
+    def unreadable(target: str, exc: OSError) -> None:
+        # /Library/LaunchDaemons holds root-only plists (vendor updaters) this
+        # user can never read; failing closed on those would stop every pass
+        # forever. Anything this user owns must be readable.
+        with contextlib.suppress(OSError):
+            if isinstance(exc, PermissionError) and os.lstat(target).st_uid != os.getuid():
+                log(f"worktree expiry: note: skipped unreadable scheduler file owned by another user: {target}")
+                return
+        raise WorktreeExpiryAbort(f"cannot read scheduler file {target}: {exc}") from exc
+
+    def walk_error(exc: OSError) -> None:
+        unreadable(str(exc.filename), exc)
+
     for base in scheduler_paths:
-        if not base.exists():
+        if not os.path.lexists(base):
             continue
-        files = [base] if base.is_file() else [p for p in sorted(base.rglob("*")) if p.is_file()]
+        if base.is_dir():
+            files = []
+            for root, _dirs, names in os.walk(base, onerror=walk_error, followlinks=False):
+                files.extend(os.path.join(root, name) for name in names)
+            files.sort()
+        else:
+            files = [str(base)]
         for file_path in files:
             try:
-                raw = file_path.read_bytes()
-            except PermissionError as exc:
-                # /Library/LaunchDaemons holds root-only plists (vendor updaters)
-                # this user can never read; failing closed on those would stop
-                # every pass forever. A file this user owns must be readable.
-                with contextlib.suppress(OSError):
-                    if os.lstat(file_path).st_uid != os.getuid():
-                        log(f"worktree expiry: note: skipped unreadable scheduler file owned by another user: {file_path}")
-                        continue
-                raise WorktreeExpiryAbort(f"cannot read scheduler file {file_path}: {exc}") from exc
+                raw = Path(file_path).read_bytes()
+            except FileNotFoundError:
+                continue  # dangling symlink: nothing it could start
             except OSError as exc:
-                raise WorktreeExpiryAbort(f"cannot read scheduler file {file_path}: {exc}") from exc
+                unreadable(file_path, exc)
+                continue
             text = raw.decode("utf-8", errors="replace")
-            if file_path.suffix == ".plist":
+            if file_path.endswith(".plist"):
                 with contextlib.suppress(Exception):
                     text += "\n" + "\n".join(strings(plistlib.loads(raw)))
-            texts.append((str(file_path), text))
-    return texts
+            entries.append((file_path, text, os.path.realpath(file_path)))
+    return entries
 
 
 class _OpenPaths:
@@ -3933,11 +3990,35 @@ class _OpenPaths:
                 for line in out.splitlines()
                 if line.startswith(b"n/")
             ]
-            if not paths:
-                raise WorktreeExpiryAbort(f"lsof returned nothing (rc={rc}): {err[:200]!r}")
+            if rc != 0 or not paths:
+                raise WorktreeExpiryAbort(f"lsof failed (rc={rc}, {len(paths)} paths): {err[:200]!r}")
             self.paths = paths
             self.taken_at = time.time()
         return self.paths
+
+
+def _gh_open_pr_branches(repo: str) -> set[str] | None:
+    """Head branch names of the repo's open PRs, or None when that cannot be known."""
+    rc, out, _ = _expiry_sh(
+        ["gh", "pr", "list", "--state", "open", "--limit", str(WORKTREE_EXPIRY_PR_LIMIT), "--json", "headRefName"],
+        cwd=Path(repo),
+        timeout=120,
+    )
+    if rc != 0:
+        return None
+    try:
+        prs = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(prs, list) or len(prs) >= WORKTREE_EXPIRY_PR_LIMIT:
+        return None  # possibly truncated: cannot prove a branch has no open PR
+    return {str(pr.get("headRefName")) for pr in prs if isinstance(pr, dict)}
+
+
+def _active_run_workdirs() -> dict[str, str]:
+    # Read-only on purpose: read_active_runs() rewrites the file when it prunes.
+    runs = _prune_active_runs(_read_active_runs_raw(active_runs_path()))
+    return {run_id: os.path.realpath(entry["workdir"]) for run_id, entry in runs.items() if entry.get("workdir")}
 
 
 def _expiry_candidates(
@@ -3974,7 +4055,9 @@ def _expiry_candidates(
             if index == 0 or entry.get("bare"):
                 continue
             source = None
-            if real in recorded:
+            # _prepare_taskdir always makes a detached worktree; a branch
+            # checkout at a recorded path was made by hand, not by Ringer.
+            if real in recorded and entry.get("detached"):
                 source = "run-record"
             elif common in adopt_repos and any(_is_within(real, root) for root in roots):
                 source = "adopted"
@@ -3998,8 +4081,97 @@ def _expiry_candidates(
     return candidates, registered
 
 
-def _archive_worktree(cand: dict[str, Any], archive: Path, stamp_date: str, idle_days: float) -> list[str]:
-    """Archive one tree into `archive`. Returns the failed checks; empty means verified."""
+def _ignored_files(tree: Path) -> tuple[list[bytes] | None, list[str]]:
+    """(non-cache ignored files to archive, ignored files too big to archive); None on error."""
+    rc, out, _ = _expiry_sh(
+        ["git", "-C", str(tree), "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]
+    )
+    if rc != 0:
+        return None, []
+    tree_b = os.fsencode(tree)
+    found: list[bytes] = []
+    for entry in (x for x in out.split(b"\0") if x and not _EXPIRY_CACHE_RE.search(x)):
+        full = os.path.join(tree_b, entry.rstrip(b"/"))
+        if os.path.isdir(full) and not os.path.islink(full):
+            found.extend(os.path.relpath(f, tree_b) for f in _walk_files(full))
+        else:
+            found.append(entry.rstrip(b"/"))
+    kept: list[bytes] = []
+    big: list[str] = []
+    for rel in found:
+        if _EXPIRY_CACHE_RE.search(rel):
+            continue
+        full = os.path.join(tree_b, rel)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if not os.path.islink(full) and st.st_size >= WORKTREE_EXPIRY_BIG_IGNORED_BYTES:
+            big.append(os.fsdecode(rel))
+        else:
+            kept.append(rel)
+    return kept, big
+
+
+def _worktree_hazard(tree: Path) -> str | None:
+    """Why this tree holds state the archive cannot capture, or None."""
+    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "rev-parse", "--absolute-git-dir"])
+    if rc != 0:
+        return "cannot inspect git dir"
+    git_dir = Path(out.decode("utf-8", errors="surrogateescape").strip())
+    rc, _, _ = _expiry_sh(["git", "-C", str(tree), "rev-parse", "--verify", "-q", "HEAD"])
+    if rc != 0:
+        return "unborn or invalid HEAD"
+    for name in _EXPIRY_IN_PROGRESS:
+        if (git_dir / name).exists():
+            return f"git operation in progress ({name})"
+    if (git_dir / "modules").exists():
+        return "has submodules"
+    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "ls-files", "-s", "-z"])
+    if rc != 0:
+        return "cannot list index"
+    for record in (r for r in out.split(b"\0") if r):
+        meta, _, rel = record.partition(b"\t")
+        if meta.startswith(b"160000"):
+            sub = os.path.join(os.fsencode(tree), rel)
+            if os.path.isdir(sub) and os.listdir(sub):
+                return "has a populated submodule"
+    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "ls-files", "-v", "-z"])
+    if rc != 0:
+        return "cannot list index flags"
+    for record in (r for r in out.split(b"\0") if r):
+        tag, rel = record[:1], record[2:]
+        # Lowercase tag = assume-unchanged, S = skip-worktree: git diff and
+        # status are blind to edits in these files, so a patch would miss them.
+        if (tag.islower() or tag == b"S") and os.path.lexists(os.path.join(os.fsencode(tree), rel)):
+            return "has skip-worktree/assume-unchanged files"
+    kept, big = _ignored_files(tree)
+    if kept is None:
+        return "cannot list ignored files"
+    if big:
+        return f"ignored file >= {WORKTREE_EXPIRY_BIG_IGNORED_BYTES // 1_000_000} MB: {big[0]}"
+    return None
+
+
+def _new_archive_dir(date_dir: Path, slug: str) -> Path:
+    for part in (date_dir.parent, date_dir):
+        part.mkdir(mode=0o700, exist_ok=True)
+    archive = date_dir / slug
+    suffix = 1
+    while archive.exists():  # never overwrite an earlier archive of a reused path
+        suffix += 1
+        archive = date_dir / f"{slug}-{suffix}"
+    archive.mkdir(mode=0o700)
+    return archive
+
+
+def _archive_worktree(
+    cand: dict[str, Any], archive: Path, stamp_date: str, idle_days: float, created_refs: dict[str, str]
+) -> list[str]:
+    """Archive one tree into `archive`. Returns the failed checks; empty means verified.
+
+    Every ref it creates is recorded in `created_refs` so a failed attempt can be undone.
+    """
     tree = Path(cand["path"])
     repo = str(cand["repo"])
     problems: list[str] = []
@@ -4009,19 +4181,54 @@ def _archive_worktree(cand: dict[str, Any], archive: Path, stamp_date: str, idle
             problems.append(what)
         return ok
 
-    if archive.exists():
-        shutil.rmtree(archive)
-    archive.mkdir(parents=True)
-    rc, status, _ = _expiry_sh(["git", "-C", str(tree), "status", "--porcelain", "-uall"])
+    def git(*args: str, env: dict[str, str] | None = None, input: bytes | None = None) -> tuple[int, bytes, bytes]:
+        return _expiry_sh(["git", "-C", str(tree), *args], env=env, input=input)
+
+    git("update-index", "-q", "--refresh")  # stat-dirty entries would show as header-only diffs
+    rc, status, _ = git("status", "--porcelain", "-uall")
     need(rc == 0, "git status")
-    rc, tracked, _ = _expiry_sh(["git", "-C", str(tree), "diff", "HEAD", "--binary"])
-    need(rc == 0, "git diff HEAD")
+    rc, tracked, _ = git("diff-index", *_EXPIRY_DIFF_FLAGS, "HEAD")
+    need(rc == 0, "diff-index HEAD")
     (archive / "tracked.patch").write_bytes(tracked)
-    rc, staged, _ = _expiry_sh(["git", "-C", str(tree), "diff", "--cached", "--binary"])
-    need(rc == 0, "git diff --cached")
+    rc, staged, _ = git("diff-index", "--cached", *_EXPIRY_DIFF_FLAGS, "HEAD")
+    need(rc == 0, "diff-index --cached HEAD")
     (archive / "staged.patch").write_bytes(staged)
-    has_tracked = any(line and not line.startswith((b"??", b"!!")) for line in status.splitlines())
-    need(not has_tracked or bool(tracked), "tracked changes but empty patch")
+
+    # Prove both patches rebuild what is on disk / in the index, using
+    # throwaway index files so the tree's own index is never touched.
+    rc, out, _ = git("rev-parse", "--path-format=absolute", "--git-path", "index")
+    real_index = Path(out.decode("utf-8", errors="surrogateescape").strip()) if rc == 0 else None
+    with tempfile.TemporaryDirectory(prefix="ringer-expiry-") as scratch:
+
+        def tree_from_patch(patch: Path, name: str) -> bytes | None:
+            env = {"GIT_INDEX_FILE": os.path.join(scratch, name)}
+            if git("read-tree", "HEAD", env=env)[0] != 0:
+                return None
+            if patch.stat().st_size and git("apply", "--cached", "--binary", "--whitespace=nowarn", str(patch), env=env)[0] != 0:
+                return None
+            rc, out, _ = git("write-tree", env=env)
+            return out.strip() if rc == 0 else None
+
+        def tree_from_index(name: str, *, add_worktree: bool) -> bytes | None:
+            if real_index is None:
+                return None
+            copy = os.path.join(scratch, name)
+            if real_index.exists():
+                shutil.copy2(real_index, copy)
+            env = {"GIT_INDEX_FILE": copy}
+            if not real_index.exists() and git("read-tree", "HEAD", env=env)[0] != 0:
+                return None
+            if add_worktree and git("add", "-u", env=env)[0] != 0:
+                return None
+            rc, out, _ = git("write-tree", env=env)
+            return out.strip() if rc == 0 else None
+
+        worktree_tree = tree_from_index("worktree", add_worktree=True)
+        need(worktree_tree is not None and tree_from_patch(archive / "tracked.patch", "tracked") == worktree_tree,
+             "tracked.patch does not rebuild the working tree")
+        index_tree = tree_from_index("index", add_worktree=False)
+        need(index_tree is not None and tree_from_patch(archive / "staged.patch", "staged") == index_tree,
+             "staged.patch does not rebuild the index")
 
     def tar(name: str, entries: list[bytes]) -> None:
         if not entries:
@@ -4034,67 +4241,47 @@ def _archive_worktree(cand: dict[str, Any], archive: Path, stamp_date: str, idle
         members = [m for m in listing.splitlines() if not m.endswith(b"/")]
         need(rc == 0 and rc2 == 0 and len(members) >= len(entries), f"{name} ({len(members)}/{len(entries)} files)")
 
-    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "ls-files", "--others", "--exclude-standard", "-z"])
+    rc, out, _ = git("ls-files", "--others", "--exclude-standard", "-z")
     need(rc == 0, "list untracked")
     untracked = [x for x in out.split(b"\0") if x]
     tar("untracked.tar.gz", untracked)
+    ignored, big = _ignored_files(tree)
+    need(ignored is not None and not big, "ignored files unarchivable")
+    tar("ignored.tar.gz", ignored or [])
 
-    rc, out, _ = _expiry_sh(
-        ["git", "-C", str(tree), "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]
-    )
-    need(rc == 0, "list ignored")
-    tree_b = os.fsencode(tree)
-    ignored: list[bytes] = []
-    for entry in (x for x in out.split(b"\0") if x and not _EXPIRY_CACHE_RE.search(x)):
-        full = os.path.join(tree_b, entry.rstrip(b"/"))
-        if os.path.isdir(full) and not os.path.islink(full):
-            for root, dirs, files in os.walk(full):
-                dirs[:] = [d for d in dirs if os.fsdecode(d) not in _EXPIRY_CACHE_DIRS]
-                ignored.extend(os.path.relpath(os.path.join(root, f), tree_b) for f in files)
-        else:
-            ignored.append(entry.rstrip(b"/"))
-    ignored = [x for x in ignored if not _EXPIRY_CACHE_RE.search(x)]
-    big: list[str] = []
-    kept: list[bytes] = []
-    for rel in ignored:
-        try:
-            st = os.lstat(os.path.join(tree_b, rel))
-        except OSError:
-            continue
-        if not os.path.islink(os.path.join(tree_b, rel)) and st.st_size >= WORKTREE_EXPIRY_BIG_IGNORED_BYTES:
-            big.append(os.fsdecode(rel))
-        else:
-            kept.append(rel)
-    tar("ignored.tar.gz", kept)
-
-    # Commits reachable only from HEAD or the per-worktree HEAD reflog.
-    pinned: dict[str, str] = {}
-    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "rev-parse", "HEAD"])
+    # Commits: HEAD (always pinned, so a later `git branch -D` cannot take it),
+    # plus every reflog entry and per-worktree ref with commits on no branch.
+    rc, out, _ = git("rev-parse", "HEAD")
     head = out.decode().strip() if need(rc == 0, "rev-parse HEAD") else ""
-    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "reflog", "--format=%H", "HEAD"])
+    rc, out, _ = git("reflog", "--format=%H", "HEAD")
     need(rc == 0, "reflog")
-    tips = list(dict.fromkeys([t for t in [head, *out.decode().split()] if t]))
+    reflog = out.decode().split()
+    rc, out, _ = git("for-each-ref", "--format=%(objectname)", "refs/worktree/", "refs/bisect/", "refs/rewritten/")
+    need(rc == 0, "per-worktree refs")
+    tips = list(dict.fromkeys([t for t in [head, *reflog, *out.decode().split()] if t]))
     exclude = ["--not", "--remotes", "--branches"]
-    rc, out, _ = _expiry_sh(["git", "-C", str(tree), "rev-list", "--count", *tips, *exclude])
-    if need(rc == 0 and bool(tips), "rev-list over HEAD and reflog") and int(out.strip() or 0) > 0:
-        for index, tip in enumerate(tips):
-            rc, out, _ = _expiry_sh(["git", "-C", str(tree), "rev-list", "--count", tip, *exclude])
-            if not need(rc == 0, f"rev-list {tip}"):
-                continue
+    unique: list[str] = []
+    for index, tip in enumerate(tips):
+        rc, out, _ = git("rev-list", "--count", tip, *exclude)
+        if not need(rc == 0, f"rev-list {tip}"):
+            continue
+        if index > 0 and int(out.strip() or 0) == 0:
+            continue
+        ref = f"refs/archive/{stamp_date}/{archive.name}/{index}"
+        if not need(_expiry_sh(["git", "check-ref-format", ref])[0] == 0, f"bad ref name {ref}"):
+            continue
+        # Empty old value: create only, never overwrite an existing pin.
+        if need(_expiry_sh(["git", "-C", repo, "update-ref", ref, tip, ""])[0] == 0, f"update-ref {ref}"):
+            created_refs[ref] = tip
             if int(out.strip() or 0) > 0:
-                ref = f"refs/archive/{stamp_date}/{archive.name}/{index}"
-                rc, _, _ = _expiry_sh(["git", "check-ref-format", ref])
-                if not need(rc == 0, f"bad ref name {ref}"):
-                    continue
-                rc, _, _ = _expiry_sh(["git", "-C", repo, "update-ref", ref, tip])
-                if need(rc == 0, f"update-ref {ref}"):
-                    pinned[ref] = tip
+                unique.append(ref)
+    if unique:
         bundle = archive / "commits.bundle"
-        rc, _, _ = _expiry_sh(["git", "-C", repo, "bundle", "create", str(bundle), *pinned, *exclude])
+        rc, _, _ = _expiry_sh(["git", "-C", repo, "bundle", "create", str(bundle), *unique, *exclude])
         rc2, _, _ = _expiry_sh(["git", "-C", repo, "bundle", "verify", str(bundle)])
-        need(rc == 0 and rc2 == 0 and bool(pinned), "bundle create/verify")
-        rc, out, _ = _expiry_sh(["git", "-C", str(tree), "rev-list", "--count", *tips, *exclude, *pinned])
-        need(rc == 0 and out.strip() == b"0", "commits left unpinned")
+        need(rc == 0 and rc2 == 0, "bundle create/verify")
+    rc, out, _ = git("rev-list", "--count", *tips, *exclude, *created_refs)
+    need(rc == 0 and out.strip() == b"0", "commits left unpinned")
 
     meta = {
         "path": cand["path"],
@@ -4102,24 +4289,31 @@ def _archive_worktree(cand: dict[str, Any], archive: Path, stamp_date: str, idle
         "branch": cand.get("branch"),
         "head": head or cand.get("head"),
         "run_id": cand.get("run_id"),
+        "run_ids": cand.get("run_ids", []),
         "task": cand.get("task"),
         "source": cand["source"],
         "archived_at": utc_now_iso(),
         "idle_days": round(idle_days, 2),
         "status": status.decode("utf-8", errors="replace")[:20000],
         "untracked_files": len(untracked),
-        "ignored_files": len(kept),
-        "big_ignored_not_archived": big,
+        "ignored_files": len(ignored or []),
         "tracked_patch_sha256": hashlib.sha256(tracked).hexdigest(),
-        "pinned_commits": pinned,
+        "pinned_commits": dict(created_refs),
         "restore": (
-            "git worktree add <dir> <head>; git -C <dir> apply tracked.patch; "
-            "tar -xzf untracked.tar.gz -C <dir>; tar -xzf ignored.tar.gz -C <dir>; "
+            "git worktree add --detach <dir> <head>; in <dir>: git apply tracked.patch (working tree), "
+            "git apply --cached staged.patch (index); tar -xzf untracked.tar.gz and ignored.tar.gz into <dir>; "
             "pinned commits: git -C <repo> for-each-ref refs/archive/ (or git fetch commits.bundle)"
         ),
     }
     (archive / "meta.json").write_text(json.dumps(meta, indent=1) + "\n", encoding="utf-8")
     return problems
+
+
+def _undo_archive(repo: str, archive: Path, created_refs: dict[str, str]) -> None:
+    """Drop a failed attempt's archive and pins; the tree is intact, so they are redundant."""
+    for ref, tip in created_refs.items():
+        _expiry_sh(["git", "-C", repo, "update-ref", "-d", ref, tip])
+    shutil.rmtree(archive, ignore_errors=True)
 
 
 def expire_worktrees(
@@ -4130,19 +4324,24 @@ def expire_worktrees(
     now: float | None = None,
     scheduler_paths: list[Path] | None = None,
     crontab_text: str | None = None,
+    open_pr_branches: Any = None,
     log: Any = print,
 ) -> list[dict[str, Any]]:
     """Archive and remove idle worktrees in scope; returns one result per candidate.
 
     action: would-expire (dry run), expired, keep (a safety gate held it, see
     reason) or fail (an archive step failed, so it was not removed).
+    `open_pr_branches(repo)` returns the head branches of open PRs, or None
+    when that cannot be known; it defaults to `gh pr list`.
     """
     import fcntl
 
     state_dir = Path(state_dir).expanduser()
+    if not state_dir.is_dir():
+        log(f"worktree expiry: no state dir {state_dir}; nothing to do")
+        return []
     lock_fh = None
     if not dry_run:
-        state_dir.mkdir(parents=True, exist_ok=True)
         lock_fh = open(state_dir / WORKTREE_EXPIRY_LOCK, "w")
         try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4158,6 +4357,7 @@ def expire_worktrees(
             now=time.time() if now is None else now,
             scheduler_paths=default_scheduler_paths() if scheduler_paths is None else scheduler_paths,
             crontab_text=crontab_text,
+            open_pr_branches=open_pr_branches or _gh_open_pr_branches,
             log=log,
         )
     finally:
@@ -4173,18 +4373,25 @@ def _expire_worktrees_locked(
     now: float,
     scheduler_paths: list[Path],
     crontab_text: str | None,
+    open_pr_branches: Any,
     log: Any,
 ) -> list[dict[str, Any]]:
     candidates, registered = _expiry_candidates(state_dir, config)
-    active = {run_id: os.path.realpath(entry["workdir"]) for run_id, entry in read_active_runs().items() if entry.get("workdir")}
     open_paths = _OpenPaths()
-    scheduler: list[tuple[str, str]] | None = None
+    scheduler: list[tuple[str, str, str]] | None = None
+    pr_branches: dict[str, set[str] | None] = {}
     stamp_date = datetime.now().strftime("%Y%m%d")
     home = str(Path.home())
     results: list[dict[str, Any]] = []
 
     def is_open(real: str, path: str, *, refresh: bool = False) -> bool:
         return any(_is_within(p, real) or _is_within(p, path) for p in open_paths.get(refresh=refresh))
+
+    def active_holder(real: str) -> str | None:
+        return next(
+            (rid for rid, wd in _active_run_workdirs().items() if _is_within(wd, real) or _is_within(real, wd)),
+            None,
+        )
 
     for cand in candidates:
         path, real = cand["path"], cand["real"]
@@ -4206,7 +4413,7 @@ def _expire_worktrees_locked(
             if any(other != real and _is_within(other, real) for other in registered):
                 result["reason"] = "nested worktree inside"
                 continue
-            holder = next((rid for rid, wd in active.items() if _is_within(wd, real) or _is_within(real, wd)), None)
+            holder = active_holder(real)
             if holder:
                 result["reason"] = f"active run {holder}"
                 continue
@@ -4217,16 +4424,40 @@ def _expire_worktrees_locked(
                 result["reason"] = f"idle {idle_days:.1f}d < {config.idle_days:g}d"
                 continue
             if scheduler is None:
-                scheduler = _scheduler_texts(scheduler_paths, crontab_text, log)
+                scheduler = _scheduler_entries(scheduler_paths, crontab_text, log)
             needles = {path, real}
             for candidate_path in (path, real):
                 if _is_within(candidate_path, home):
                     rel = candidate_path[len(home):].lstrip("/")
                     needles.update({f"~/{rel}", f"$HOME/{rel}", f"${{HOME}}/{rel}"})
-            pattern = re.compile("|".join(re.escape(n) + _EXPIRY_PATH_CHAR for n in sorted(needles)))
-            source = next((name for name, text in scheduler if pattern.search(text)), None)
+            # IGNORECASE: APFS is case-insensitive, and a false match only keeps a tree.
+            pattern = re.compile(
+                "|".join(re.escape(n) + _EXPIRY_PATH_CHAR for n in sorted(needles)), re.IGNORECASE
+            )
+            source = next(
+                (
+                    name for name, text, file_real in scheduler
+                    if pattern.search(text) or (file_real and _is_within(file_real, real))
+                ),
+                None,
+            )
             if source:
                 result["reason"] = f"referenced by scheduler {source}"
+                continue
+            if cand.get("branch"):
+                repo_key = str(cand["repo"])
+                if repo_key not in pr_branches:
+                    pr_branches[repo_key] = open_pr_branches(repo_key)
+                branches = pr_branches[repo_key]
+                if branches is None:
+                    result["reason"] = f"cannot check open PRs for branch {cand['branch']}"
+                    continue
+                if cand["branch"] in branches:
+                    result["reason"] = f"open PR on branch {cand['branch']}"
+                    continue
+            hazard = _worktree_hazard(Path(path))
+            if hazard:
+                result["reason"] = hazard
                 continue
             if is_open(real, path):
                 result["reason"] = "open by a process (cwd or file)"
@@ -4234,18 +4465,26 @@ def _expire_worktrees_locked(
             if dry_run:
                 result["action"] = "would-expire"
                 continue
-            archive = state_dir / "patches" / stamp_date / _expiry_slug(Path(real))
+            archive = _new_archive_dir(state_dir / "patches" / stamp_date, _expiry_slug(Path(real)))
             result["archive"] = str(archive)
-            problems = _archive_worktree(cand, archive, stamp_date, idle_days)
+            created_refs: dict[str, str] = {}
+            try:
+                problems = _archive_worktree(cand, archive, stamp_date, idle_days, created_refs)
+            except Exception as exc:
+                problems = [f"error: {exc}"]
             if not problems and _worktree_activity(Path(path))[0] > newest:
                 problems.append("tree written during archive")
             if not problems and is_open(real, path, refresh=True):
                 problems.append("tree opened during archive")
+            if not problems and active_holder(real):
+                problems.append("an active run started using it during archive")
             if problems:
-                result.update(action="fail", reason="; ".join(problems))
+                _undo_archive(str(cand["repo"]), archive, created_refs)
+                result.update(action="fail", reason="; ".join(problems), archive=None)
                 continue
             rc, _, err = _expiry_sh(["git", "-C", str(cand["repo"]), "worktree", "remove", "--force", path])
             if rc != 0:
+                # Keep the archive: a failed remove may already have deleted files.
                 result.update(action="fail", reason=f"worktree remove: {err.decode(errors='replace').strip()[:200]}")
                 continue
             result["action"] = "expired"
@@ -4322,8 +4561,8 @@ def start_worktree_expiry_auto(
 def run_expire_worktrees_command(config: AppConfig, args: argparse.Namespace) -> int:
     expiry = config.worktree_expiry
     if args.idle_days is not None:
-        if args.idle_days <= 0:
-            raise ValueError("--idle-days must be positive")
+        if not math.isfinite(args.idle_days) or args.idle_days <= 0:
+            raise ValueError("--idle-days must be a positive number")
         expiry = dataclass_replace(expiry, idle_days=float(args.idle_days))
     print(f"worktree expiry {'dry run ' if args.dry_run else ''}at {utc_now_iso()}")
     results = expire_worktrees(config.state_dir, expiry, dry_run=args.dry_run)
