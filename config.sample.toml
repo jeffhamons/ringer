@@ -37,6 +37,21 @@ reuse_open_tab = true
 # For one command, pass --no-self-update. To disable automatic checks in an
 # environment or service, set RINGER_NO_SELF_UPDATE=1.
 
+[worktree_expiry]
+# Failed tasks keep their worktrees for post-mortems. After a `run`, at most once
+# a day, a detached pass archives each task worktree idle this long (newest file
+# write, caches and venvs ignored) under <state_dir>/patches/<date>/ and pins its
+# unpushed and reflog-only commits under refs/archive/<date>/ in the repo, then
+# removes it. Locked trees, trees in use by a process or an active run, and trees
+# named by launchd, cron or ~/.claude/scheduled-tasks are kept. Branches are
+# never deleted. `./ringer.py expire-worktrees --dry-run` shows what would go.
+# idle_days = 7
+# auto = true            # false: only the explicit command runs; or set RINGER_NO_WORKTREE_EXPIRY=1
+# Ringer's own task worktrees are always in scope. To also expire worktrees an
+# orchestrator made by hand, list the repo and the roots they live under:
+# repos = ["~/projects/my-repo"]
+# roots = ["~/my-repo-worktrees"]
+
 # Optional model steering. The directory must contain profiles/ with one
 # Markdown profile per model. Ringer creates observations/ringer/ beneath this
 # directory automatically as attempts finish.

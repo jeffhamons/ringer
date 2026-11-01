@@ -116,6 +116,8 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 
 > **Worktree footgun:** on PASS the task's worktree is removed — including anything written inside it. In worktrees mode, worker logs live outside task worktrees in `workdir/logs/`; have workers write deliverables outside the worktree too, or have your `check` copy artifacts out before it exits 0.
 
+Failed tasks keep their worktrees for post-mortems, but not forever. After a `run`, at most once a day, Ringer starts a detached pass that expires task worktrees idle for 7 days: it archives the tracked and staged diffs, untracked and non-cache ignored files and a `meta.json` under `~/.ringer/patches/<date>/`, pins every unpushed or reflog-only commit under `refs/archive/<date>/` in the repo plus a verified bundle, and only then runs `git worktree remove --force`. Any failed archive step keeps the tree. Locked trees, trees a process or active run is using, and trees named by launchd, cron or `~/.claude/scheduled-tasks` are kept; branches are never deleted. `./ringer.py expire-worktrees --dry-run` reports what would go. Tune or extend it under `[worktree_expiry]` in config.toml (see `config.sample.toml`).
+
 Not sure what your tasks even are yet? [`docs/interview-prompt.md`](docs/interview-prompt.md) is a prompt you paste into any chatbot; it interviews you about the job and hands back a brief your orchestrating agent can turn into a manifest. Ready-made skeletons for the patterns that work live in [`templates/`](templates/).
 
 ## `ask` — one bounded question, one clean worker
