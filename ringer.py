@@ -4016,15 +4016,24 @@ class _OpenPaths:
 
 
 def _github_remotes(repo: str) -> set[str] | None:
-    """owner/name of every GitHub remote of the repo."""
+    """owner/name of every remote, or None if any remote is not a recognisable github.com URL.
+
+    An unparseable remote (host alias, Enterprise, local path) may still carry
+    open PRs, so PR state is unknown rather than "none".
+    """
     rc, out, _ = _expiry_sh(["git", "-C", repo, "remote", "-v"], timeout=60)
     if rc != 0:
         return None
     found: set[str] = set()
     for line in out.decode("utf-8", errors="replace").splitlines():
-        match = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?(?:\s|$)", line)
-        if match:
-            found.add(f"{match.group(1)}/{match.group(2)}")
+        if not line.strip():
+            continue
+        match = re.search(
+            r"github\.com(?::\d+)?[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?(?:\s|$)", line, re.IGNORECASE
+        )
+        if not match:
+            return None
+        found.add(f"{match.group(1)}/{match.group(2)}")
     return found
 
 
@@ -4041,7 +4050,7 @@ def _gh_open_prs(repo: str) -> tuple[set[str], set[str]] | None:
     for remote in sorted(remotes):
         rc, out, _ = _expiry_sh(
             [
-                "gh", "pr", "list", "--repo", remote, "--state", "open",
+                "gh", "pr", "list", "--repo", f"github.com/{remote}", "--state", "open",
                 "--limit", str(WORKTREE_EXPIRY_PR_LIMIT), "--json", "headRefName,headRefOid",
             ],
             cwd=Path(repo),

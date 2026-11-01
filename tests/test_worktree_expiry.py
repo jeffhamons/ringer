@@ -380,7 +380,13 @@ class WorktreeExpiryTests(unittest.TestCase):
     def test_github_remotes_parsed(self) -> None:
         git("remote", "add", "fork", "git@github.com:me/thing.git", cwd=self.repo)
         git("remote", "add", "up", "https://github.com/Org/thing", cwd=self.repo)
-        self.assertEqual(ringer._github_remotes(str(self.repo)), {"me/thing", "Org/thing"})
+        # origin is a local path: PR state is unknowable, not "no PRs".
+        self.assertIsNone(ringer._github_remotes(str(self.repo)))
+        git("remote", "remove", "origin", cwd=self.repo)
+        git("remote", "add", "port", "ssh://git@ssh.GitHub.com:443/me/other.git", cwd=self.repo)
+        self.assertEqual(ringer._github_remotes(str(self.repo)), {"me/thing", "Org/thing", "me/other"})
+        git("remote", "add", "alias", "git@github.com-work:me/thing.git", cwd=self.repo)
+        self.assertIsNone(ringer._github_remotes(str(self.repo)))
 
     def test_inherited_git_dir_does_not_misdirect(self) -> None:
         wt = self.add_worktree(self.base / "wts" / "job-env")
