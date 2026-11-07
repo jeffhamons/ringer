@@ -3597,14 +3597,20 @@ def start_catalog_auto_refresh(
 
 # Promotion ladder: one rule, the evidence status (80% Wilson lower bound of
 # the first-try rate at or above the quality floor, n >= EVIDENCE_MIN_TASKS).
-def proven_model_group(group: dict[str, Any]) -> bool:
-    return (
-        model_scoreboard_status(
-            int(group.get("tasks") or 0),
-            float(group.get("first_try_pass_rate") or 0),
+def group_evidence_counts(group: dict[str, Any]) -> tuple[int, float]:
+    """In-window task count and first-try rate; groups without window fields
+    (hand-built dicts) fall back to their all-time numbers."""
+    if "evidence_tasks" in group:
+        return (
+            int(group.get("evidence_tasks") or 0),
+            float(group.get("evidence_first_try_pass_rate") or 0),
         )
-        == "SUPPORTED"
-    )
+    return int(group.get("tasks") or 0), float(group.get("first_try_pass_rate") or 0)
+
+
+def proven_model_group(group: dict[str, Any]) -> bool:
+    tasks, rate = group_evidence_counts(group)
+    return model_scoreboard_status(tasks, rate) == "SUPPORTED"
 
 
 def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
@@ -7867,6 +7873,8 @@ def aggregate_model_log_rows(
                 "median_tokens": None,
                 "last_seen": "",
                 "_first_try_passed": 0,
+                "_w_tasks": 0,
+                "_w_first_passed": 0,
                 "_duration_ms": [],
                 "_tokens": [],
             },
@@ -7929,6 +7937,8 @@ def aggregate_model_log_rows(
                 "median_tokens": None,
                 "last_seen": "",
                 "_first_try_passed": 0,
+                "_w_tasks": 0,
+                "_w_first_passed": 0,
                 "_duration_ms": [],
                 "_tokens": [],
             },
@@ -7941,6 +7951,10 @@ def aggregate_model_log_rows(
             group["failed"] += 1
         if model_log_text(first.get("verdict")).upper() == "PASS":
             group["_first_try_passed"] += 1
+        if evidence_in_window(final.get("logged_at")):
+            group["_w_tasks"] += 1
+            if model_log_text(first.get("verdict")).upper() == "PASS":
+                group["_w_first_passed"] += 1
         duration_ms = model_log_int(final.get("duration_ms"))
         if duration_ms is not None:
             group["_duration_ms"].append(duration_ms)
@@ -7977,6 +7991,10 @@ def aggregate_model_log_rows(
                 "failed": group["failed"],
                 "pass_rate": group["pass_rate"],
                 "first_try_pass_rate": group["first_try_pass_rate"],
+                "evidence_tasks": group["_w_tasks"],
+                "evidence_first_try_pass_rate": (
+                    group["_w_first_passed"] / group["_w_tasks"] if group["_w_tasks"] else 0.0
+                ),
                 "median_duration_ms": group["median_duration_ms"],
                 "median_tokens": group["median_tokens"],
                 "last_seen": group["last_seen"],
@@ -8375,9 +8393,7 @@ def enrich_model_groups_with_identity(
         if item.get("unattributed") or item.get("misrouted") or item.get("invalidated_only"):
             item["tier"] = "unranked"
         elif "tier" not in item:
-            item["tier"] = model_scoreboard_tier(
-                int(item.get("tasks") or 0), float(item.get("first_try_pass_rate") or 0)
-            )
+            item["tier"] = model_scoreboard_tier(*group_evidence_counts(item))
         item["bucket_id"] = "|".join(
             (
                 str(item.get("engine") or ""),
