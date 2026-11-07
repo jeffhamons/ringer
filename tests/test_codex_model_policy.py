@@ -108,5 +108,27 @@ class CodexModelPolicyTests(unittest.TestCase):
         )
 
 
+    def test_ask_rejects_other_codex_model(self) -> None:
+        packet = ringer.ContextPacket(
+            text="q", packet_bytes=1, source_bytes=0, selected=(), skipped=()
+        )
+
+        def build(model: str | None) -> Manifest:
+            return ringer.one_request_manifest(
+                packet=packet,
+                workdir=Path(self.root),
+                engine="codex",
+                timeout_s=60,
+                reasoning_effort="low",
+                model=model,
+                redact=False,
+            )
+
+        with self.assertRaisesRegex(ValueError, "gpt-6.1-sol"):
+            build("gpt-5.5")
+        self.assertEqual("gpt-6.1-sol", build("gpt-6.1-sol").tasks[0].model)
+        self.assertEqual("", build(None).tasks[0].model)
+
+
 if __name__ == "__main__":
     unittest.main()

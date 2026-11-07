@@ -13540,6 +13540,11 @@ def one_request_manifest(
 ) -> Manifest:
     engine_args: list[str] = []
     if engine == DEFAULT_ENGINE_NAME:
+        if model and model not in CODEX_ALLOWED_MODELS:
+            raise ValueError(
+                f"--model {model!r} is not allowed on the codex engine; the only "
+                f"allowed codex model is {', '.join(CODEX_ALLOWED_MODELS)}."
+            )
         engine_args.extend(("-c", f"model_reasoning_effort={reasoning_effort}"))
     elif model and engine != "opencode":
         raise ValueError("--model is supported only by the codex and opencode engines")
