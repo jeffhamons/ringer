@@ -11995,15 +11995,7 @@ class RingerRunner:
         verdict: str,
         duration_ms: int,
     ) -> None:
-        if worker_never_ran(worker) or (
-            verdict not in ("PASS", "TIMEOUT")
-            and worker_zero_token_early_exit(
-                worker,
-                runtime.task.engine,
-                self.config.engines.get(runtime.task.engine),
-                duration_s=duration_ms / 1000.0,
-            )
-        ):
+        if worker_never_ran(worker):
             # No model was invoked, so there is no model evidence to log.
             # The task record (run JSON) still carries the full attempt state;
             # only the per-model scoreboard is protected here.
@@ -12021,6 +12013,15 @@ class RingerRunner:
             runtime.task,
             engine,
             runtime.last_worker_command,
+        )
+        # A fast, tokenless, plain FAIL on a token-reporting engine is infra
+        # noise: keep the row for the record but exclude it from evidence.
+        # Only FAIL qualifies; ENGINE_DOWN, TIMEOUT and the rest stay as logged.
+        zero_token_excluded = verdict == "FAIL" and worker_zero_token_early_exit(
+            worker,
+            runtime.task.engine,
+            engine,
+            duration_s=duration_ms / 1000.0,
         )
         reported_model = model_log_text(worker.reported_model) or None
         mismatch = bool(reported_model and resolved_model and reported_model != resolved_model)
@@ -12099,6 +12100,17 @@ class RingerRunner:
                 "cost_usd": runtime.cost_usd,
                 "model_steps": runtime.model_steps,
                 "retry": retrying,
+                **(
+                    {
+                        "evidence_excluded": True,
+                        "invalidation_reason": (
+                            "zero-token early exit on a token-reporting engine "
+                            "(infrastructure, not model evidence)"
+                        ),
+                    }
+                    if zero_token_excluded
+                    else {}
+                ),
             }
         )
 

@@ -34,7 +34,7 @@ from ringer import (  # noqa: E402
     worker_never_ran,
     worker_zero_token_early_exit,
 )
-from ringer import EngineConfig, load_engines  # noqa: E402
+from ringer import AppConfig, EngineConfig, EvalConfig, Manifest, RingerRunner, load_engines  # noqa: E402
 
 
 def toml_string(value: object) -> str:
@@ -122,6 +122,73 @@ class ZeroTokenEarlyExitTests(unittest.TestCase):
         self.assertFalse(self.check(WorkerResult(returncode=1, timed_out=False, tokens=900)))
         self.assertFalse(self.check(WorkerResult(returncode=None, timed_out=True, tokens=None)))
         self.assertFalse(self.check(WorkerResult(returncode=0, timed_out=False, tokens=None)))
+
+
+class ZeroTokenRowTests(unittest.TestCase):
+    """A fast tokenless FAIL is written but flagged evidence_excluded; other
+    verdicts (TIMEOUT, ENGINE_DOWN) on the same worker shape are never touched."""
+
+    def log_one(self, verdict: str) -> dict[str, object]:
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "runs.jsonl"
+            config = AppConfig.load(None)
+            engine = replace(
+                config.engines["opencode"], token_regex=r"tokens used:?\s*([0-9,]+)", token_format=None
+            )
+            config = replace(
+                config,
+                state_dir=root / "state",
+                eval=EvalConfig(backend="jsonl", jsonl_path=log_path),
+                engines={**config.engines, "opencode": engine},
+            )
+            manifest = Manifest.from_obj(
+                {
+                    "run_name": "zero-token-row",
+                    "workdir": str(root / "work"),
+                    "tasks": [
+                        {
+                            "key": "t",
+                            "spec": "Create output.txt with the requested value and keep the change scoped.",
+                            "check": "test -s output.txt",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                            "engine": "opencode",
+                            "model": "openrouter/z-ai/glm-5.3",
+                        }
+                    ],
+                }
+            )
+            runner = RingerRunner(manifest, config=config, identity="tester", dashboard_enabled=False)
+            runtime = runner.runtimes[0]
+            runner._log_attempt(
+                runtime,
+                runtime.task.spec,
+                False,
+                WorkerResult(returncode=1, timed_out=False, tokens=None),
+                VerifyResult(ok=False, check_returncode=1, check_timed_out=False, raw_output_excerpt="x"),
+                verdict,
+                5000,
+            )
+            lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+            self.assertEqual(1, len(lines), f"{verdict}: row must be written, not dropped")
+            return json.loads(lines[0])
+
+    def test_fast_zero_token_fail_is_written_but_excluded(self) -> None:
+        payload = self.log_one("FAIL")
+        self.assertIs(payload["evidence_excluded"], True)
+        self.assertTrue(payload["invalidation_reason"])
+        from ringer import model_log_row_is_invalidated
+
+        self.assertTrue(model_log_row_is_invalidated(payload))
+
+    def test_timeout_and_engine_down_rows_are_not_excluded(self) -> None:
+        for verdict in ("TIMEOUT", "ENGINE_DOWN"):
+            payload = self.log_one(verdict)
+            self.assertNotEqual(True, payload.get("evidence_excluded"), verdict)
+            self.assertFalse(payload.get("invalidation_reason"), verdict)
 
 
 class SpawnFailureEndToEndTests(unittest.TestCase):
