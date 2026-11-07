@@ -274,7 +274,7 @@ There is no default model. Do not pick from memory or from a candidate list.
    rung; retry the same model once only for infra, flakiness or a fixed spec or
    checker bug. Do not re-ask Jeff per job when the rung is SUPPORTED or a
    Jeff-approved unexpired PROVISIONAL.
-3. DeepSeek V4.1 Flash runs at its highest available effort (`--variant high`; opencode rejects `max` for it) on every rung. Effort is not a
+3. DeepSeek V4.1 Flash runs at max effort (`--variant max`) on every rung; max is a blocked default until the A1 max lanes run clean (one transient opencode server error seen 2026-11-07), and `high` is a labeled fallback, never a silent substitute. Effort is not a
    step-up: a first-try failure steps straight to the next model. Record
    effort with `engine_args ["--variant", "high"]`.
 4. Cross-cutting step-up is Grok while it has quota; on ENGINE_DOWN or quota
