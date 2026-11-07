@@ -364,9 +364,42 @@ source = "fixture"
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 rc = ringer.main(["lint", str(manifest_path)])
-        self.assertIn("lint: alias-task: task_type 'bugfix'", output.getvalue())
+        self.assertIn("lint: WARN: alias-task: task_type 'bugfix'", output.getvalue())
         self.assertNotIn("ERROR", output.getvalue())
         self.assertEqual(0, rc, output.getvalue())
+
+    def test_lint_command_still_exits_one_for_non_warn_finding(self) -> None:
+        manifest_path = self.root / "cannot-fail.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_name": "cannot-fail-cli",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "t",
+                            "engine": "opencode",
+                            "model": "openrouter/z-ai/glm-5.3",
+                            "task_type": "code-feature",
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "true",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_registry = ROOT / "registry" / "model-identity.toml"
+        with mock.patch.object(ringer, "default_model_registry_path", return_value=real_registry), mock.patch.object(
+            ringer, "maybe_self_update"
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = ringer.main(["lint", str(manifest_path)])
+        self.assertIn("check cannot fail", output.getvalue())
+        self.assertEqual(1, rc, output.getvalue())
 
     def test_lint_command_reports_error_and_escape_flag_passes(self) -> None:
         manifest_path = self.root / "ringer.json"

@@ -2204,12 +2204,12 @@ def lint_manifest(
                 )
         if task.task_type in TASK_TYPE_ALIASES:
             findings.append(
-                f"{task.key}: task_type {task.task_type!r} is an alias; use "
+                f"WARN: {task.key}: task_type {task.task_type!r} is an alias; use "
                 f"{TASK_TYPE_ALIASES[task.task_type]!r} so the model log buckets it with the rest."
             )
         elif task.task_type and task.task_type not in CANONICAL_TASK_TYPES:
             findings.append(
-                f"{task.key}: task_type {task.task_type!r} is not in the known list "
+                f"WARN: {task.key}: task_type {task.task_type!r} is not in the known list "
                 f"({', '.join(sorted(CANONICAL_TASK_TYPES))}); it will be its own bucket in the model log."
             )
         if task.task_type in ticketed_types and not task.ticket:
@@ -14620,8 +14620,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             if findings:
                 print_lint_findings(findings)
-                # Warnings (task-type aliases and the like) print but do not fail.
-                return 1 if any(f.startswith("ERROR") for f in findings) else 0
+                # Only WARN:-prefixed advisories (task-type nudges) print without failing.
+                return 0 if all(f.startswith("WARN:") for f in findings) else 1
             print(f"lint: clean ({len(manifest.tasks)} tasks)")
             return 0
 
