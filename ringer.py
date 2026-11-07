@@ -3595,16 +3595,15 @@ def start_catalog_auto_refresh(
         return None
 
 
-# Promotion ladder: 3+ tasks and first-try >= 2/3 ("2 of 3"). The exact
-# fraction matters — 0.67 would misclassify a literal 2-of-3 record.
-PROVEN_MIN_TASKS = 3
-PROVEN_MIN_FIRST_TRY = 2 / 3
-
-
+# Promotion ladder: one rule, the evidence status (80% Wilson lower bound of
+# the first-try rate at or above the quality floor, n >= EVIDENCE_MIN_TASKS).
 def proven_model_group(group: dict[str, Any]) -> bool:
     return (
-        int(group.get("tasks") or 0) >= PROVEN_MIN_TASKS
-        and float(group.get("first_try_pass_rate") or 0) >= PROVEN_MIN_FIRST_TRY
+        model_scoreboard_status(
+            int(group.get("tasks") or 0),
+            float(group.get("first_try_pass_rate") or 0),
+        )
+        == "SUPPORTED"
     )
 
 

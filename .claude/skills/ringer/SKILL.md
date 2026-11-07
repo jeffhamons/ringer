@@ -313,8 +313,9 @@ exploration candidate from `./ringer.py models --explore --task-type <type>`
 experiment. Never explore on time-critical work, never with more than a
 small slice of a batch, and name the experiment when presenting the engine
 ask so the human can veto it. Promotion ladder (computed by --explore):
-untested → probation (some evidence) → proven for a task_type (3+ tasks,
-first-try ≥ 0.67). Proven models earn bigger lanes in that type and an
+untested → probation (some evidence) → proven for a task_type. "Proven"
+means SUPPORTED: n ≥ 8 and the 80% Wilson lower bound of the first-try rate
+is ≥ 0.45; volume alone never proves a model. Proven models earn bigger lanes in that type and an
 audition one rung up in adjacent types; repeated first-attempt failures end
 the audition — record the demotion in MODEL-NOTES so the next orchestrator
 doesn't re-run the experiment.
