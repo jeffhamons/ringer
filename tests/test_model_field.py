@@ -23,6 +23,7 @@ from ringer import (  # noqa: E402
     WorkerResult,
     build_worker_command,
     effective_model_from_command,
+    effective_reasoning_effort_from_command,
     load_engines,
     preflight_engine_bins,
     validate_manifest_engines,
@@ -303,6 +304,20 @@ class ModelValidationTests(unittest.TestCase):
         config = self.config({"worker": absolute, "shellworker": bare})
         preflight_engine_bins(self.manifest(self.base_task(engine="worker")), config)
         preflight_engine_bins(self.manifest(self.base_task(engine="shellworker")), config)
+
+
+class OpencodeVariantEffortTests(unittest.TestCase):
+    def test_variant_flag_is_recorded_as_effort(self) -> None:
+        for argv, want in [
+            (["opencode", "run", "--variant", "max", "x"], "max"),
+            (["opencode", "run", "--variant=low", "x"], "low"),
+            (["opencode", "run", "--variant", "high"], "high"),
+            (["opencode", "run", "--variant", "bogus"], None),
+            (["opencode", "run", "--variant"], None),
+            (["opencode", "run"], None),
+            (["codex", "-c", "model_reasoning_effort=high"], "high"),
+        ]:
+            self.assertEqual(want, effective_reasoning_effort_from_command(argv), argv)
 
 
 if __name__ == "__main__":
