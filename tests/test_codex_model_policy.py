@@ -91,6 +91,22 @@ class CodexModelPolicyTests(unittest.TestCase):
         manifest = make_manifest(self.root, engine="opencode", model="openrouter/x/y")
         self.assertFalse(self.errors(lint_manifest(manifest)))
 
+    def test_run_validation_refuses_like_missing_opencode_model(self) -> None:
+        for default, task_model in (("gpt-5.6-sol", ""), ("", ""), ("gpt-6.1-sol", "gpt-5.5")):
+            config = config_with_default(default)
+            fields = {"model": task_model} if task_model else {}
+            manifest = make_manifest(self.root, **fields)
+            with self.assertRaisesRegex(ValueError, "gpt-6.1-sol"):
+                validate_manifest_engines(manifest, config)
+
+    def test_run_validation_accepts_sol(self) -> None:
+        validate_manifest_engines(
+            make_manifest(self.root), config_with_default("gpt-6.1-sol")
+        )
+        validate_manifest_engines(
+            make_manifest(self.root, model="gpt-6.1-sol"), config_with_default("")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

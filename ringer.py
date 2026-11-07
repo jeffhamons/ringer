@@ -12869,6 +12869,9 @@ def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
         swallow = claude_list_flag_swallow_message(task)
         if swallow and args_template_puts_spec_after_engine_args(engine.args_template):
             raise ValueError(swallow)
+        policy_error = codex_model_policy_error(task, config)
+        if policy_error:
+            raise ValueError(policy_error)
         requires_model = any("{model}" in item for item in engine.args_template)
         accepts_model = requires_model or "{model_args}" in engine.args_template
         if requires_model and not (task.model or engine.model_default):

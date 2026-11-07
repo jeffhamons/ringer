@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from dataclasses import replace
 import unittest
 from pathlib import Path
 
@@ -210,8 +211,9 @@ class ModelValidationTests(unittest.TestCase):
         return task
 
     def test_model_on_non_harness_engine_is_rejected(self) -> None:
-        config = self.config({"codex": codex_like_engine()})
-        manifest = self.manifest(self.base_task(engine="codex", model="openrouter/x"))
+        # Not named codex: the codex model policy would reject this first.
+        config = self.config({"plain": replace(codex_like_engine(), name="plain")})
+        manifest = self.manifest(self.base_task(engine="plain", model="openrouter/x"))
         with self.assertRaisesRegex(ValueError, "silently ignored"):
             validate_manifest_engines(manifest, config)
 
@@ -233,15 +235,15 @@ class ModelValidationTests(unittest.TestCase):
 
     def test_model_args_without_a_resolved_model_is_valid(self) -> None:
         engine = EngineConfig(
-            name="codex",
+            name="plain",
             bin="codex",
             args_template=("exec", "{model_args}", "{spec}"),
             full_access_args=(),
             sandbox_args=(),
             token_regex=None,
         )
-        config = self.config({"codex": engine})
-        manifest = self.manifest(self.base_task(engine="codex"))
+        config = self.config({"plain": engine})
+        manifest = self.manifest(self.base_task(engine="plain"))
         validate_manifest_engines(manifest, config)
 
     def test_eval_row_falls_back_to_model_in_last_worker_command(self) -> None:
