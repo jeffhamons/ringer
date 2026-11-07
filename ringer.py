@@ -9322,10 +9322,57 @@ def catalog_identity_fields(
     return {"model_display": display, "lab": lab}
 
 
+# Evidence status per (model, effort) slot: 80% Wilson interval of the
+# first-try rate against a quality floor, one rule for every caller.
+WILSON_Z_80 = 1.2816
+EVIDENCE_MIN_TASKS = 8
+EVIDENCE_QUALITY_FLOOR = 0.45
+EVIDENCE_STALE_DAYS = 90
+
+
+def wilson_interval(successes: int, n: int, z: float = WILSON_Z_80) -> tuple[float, float]:
+    if n <= 0:
+        return (0.0, 1.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+def model_scoreboard_status(tasks: int, first_try_pass_rate: float) -> str:
+    if tasks < EVIDENCE_MIN_TASKS:
+        return "UNTESTED"
+    lower, upper = wilson_interval(round(first_try_pass_rate * tasks), tasks)
+    if lower >= EVIDENCE_QUALITY_FLOOR:
+        return "SUPPORTED"
+    if upper < EVIDENCE_QUALITY_FLOOR:
+        return "CONTRADICTED"
+    return "PROVISIONAL"
+
+
+def evidence_is_stale(last_seen: Any, now: Any = None) -> bool:
+    def parse(value: Any) -> datetime | None:
+        text = model_log_text(value)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    seen = parse(last_seen)
+    if seen is None:
+        return False
+    current = parse(now) or datetime.now(timezone.utc)
+    return (current - seen).days > EVIDENCE_STALE_DAYS
+
+
 def model_scoreboard_tier(tasks: int, first_try_pass_rate: float) -> str:
-    # Same promotion rule as proven_model_group: volume alone never proves a
-    # model — a 0% pass rate with many tasks is evidence against, not for.
-    if tasks >= PROVEN_MIN_TASKS and first_try_pass_rate >= PROVEN_MIN_FIRST_TRY:
+    # Legacy names: only SUPPORTED is "proven". Volume alone never proves a
+    # model; the Wilson lower bound must clear the floor.
+    if model_scoreboard_status(tasks, first_try_pass_rate) == "SUPPORTED":
         return "proven"
     return "probation"
 
@@ -9514,6 +9561,8 @@ def aggregate_model_scoreboard_rows(
                 "unattributed": entry["unattributed"],
                 "invalidated_only": bool(entry["invalidated_rows"] and not tasks_count),
                 "tier": tier,
+                "evidence_status": model_scoreboard_status(tasks_count, first_try_rate),
+                "evidence_stale": evidence_is_stale(entry["last_seen"]),
                 "tasks": tasks_count,
                 "attempts": entry["attempts"],
                 "invalidated_rows": entry["invalidated_rows"],

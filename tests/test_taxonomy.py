@@ -27,6 +27,10 @@ from ringer import (  # noqa: E402
     WorkerResult,
     aggregate_model_log_rows,
     aggregate_model_scoreboard_rows,
+    model_scoreboard_tier,
+    model_scoreboard_status,
+    wilson_interval,
+    evidence_is_stale,
     build_models_api_payload,
     create_read_model_schema,
     enrich_model_groups_with_identity,
@@ -298,6 +302,40 @@ source = "fixture"
             ).fetchone())
             self.assertEqual(3, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(3, conn.execute("SELECT version FROM schema_version").fetchone()[0])
+
+
+class WilsonTierTests(unittest.TestCase):
+    def test_status_thresholds(self) -> None:
+        cases = [
+            (3, 2 / 3, "UNTESTED"),
+            (7, 1.0, "UNTESTED"),
+            (8, 6 / 8, "SUPPORTED"),
+            (10, 7 / 10, "SUPPORTED"),
+            (8, 5 / 8, "PROVISIONAL"),
+            (10, 6 / 10, "PROVISIONAL"),
+            (10, 0.0, "CONTRADICTED"),
+            (20, 3 / 20, "CONTRADICTED"),
+        ]
+        for tasks, rate, want in cases:
+            self.assertEqual(want, model_scoreboard_status(tasks, rate), (tasks, rate))
+
+    def test_legacy_tier_names_map_from_status(self) -> None:
+        self.assertEqual("proven", model_scoreboard_tier(8, 6 / 8))
+        self.assertEqual("probation", model_scoreboard_tier(3, 2 / 3))
+        self.assertEqual("probation", model_scoreboard_tier(8, 5 / 8))
+        self.assertEqual("probation", model_scoreboard_tier(10, 0.0))
+
+    def test_wilson_interval_is_80_percent(self) -> None:
+        lo, hi = wilson_interval(6, 8)
+        self.assertAlmostEqual(0.5, lo, delta=0.06)
+        self.assertAlmostEqual(0.89, hi, delta=0.02)
+        self.assertEqual((0.0, 1.0), wilson_interval(0, 0))
+
+    def test_stale_flag_after_90_days(self) -> None:
+        now = "2026-11-07T00:00:00+00:00"
+        self.assertTrue(evidence_is_stale("2026-01-01T00:00:00+00:00", now=now))
+        self.assertFalse(evidence_is_stale("2026-10-20T00:00:00+00:00", now=now))
+        self.assertFalse(evidence_is_stale("", now=now))
 
 
 if __name__ == "__main__":
