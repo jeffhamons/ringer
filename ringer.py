@@ -9477,6 +9477,8 @@ def aggregate_model_scoreboard_rows(
                 "_duration_ms": [],
                 "_tokens": [],
                 "_costs": [],
+                "_cost_attempts": 0,
+                "_cost_first_passed": 0,
                 "_task_types": {},
             },
         )
@@ -9545,6 +9547,8 @@ def aggregate_model_scoreboard_rows(
                 "_duration_ms": [],
                 "_tokens": [],
                 "_costs": [],
+                "_cost_attempts": 0,
+                "_cost_first_passed": 0,
                 "_task_types": {},
             },
         )
@@ -9580,6 +9584,8 @@ def aggregate_model_scoreboard_rows(
             tokens = model_log_int(row.get("worker_tokens"))
             if tokens is not None:
                 model_entry["_tokens"].append(tokens)
+        # Each row's cost_usd is the task's RUNNING total across attempts
+        # (_refresh_cost), so the task's cost is its largest row, never the sum.
         task_costs = [
             float(row["cost_usd"])
             for row in ordered
@@ -9587,7 +9593,9 @@ def aggregate_model_scoreboard_rows(
             and not isinstance(row.get("cost_usd"), bool)
         ]
         if task_costs:
-            model_entry["_costs"].append(sum(task_costs))
+            model_entry["_costs"].append(max(task_costs))
+            model_entry["_cost_attempts"] += len(ordered)
+            model_entry["_cost_first_passed"] += 1 if first_passed else 0
 
     finalized: list[dict[str, Any]] = []
     for entry in models.values():
@@ -9616,9 +9624,13 @@ def aggregate_model_scoreboard_rows(
             if entry["_costs"] and entry["engine"] not in PLAN_BILLED_ENGINES
             else None
         )
+        # c per attempt and p over the same costed tasks; the per-task cost
+        # already includes retries, so it is not divided by p again.
+        costed_tasks = len(entry["_costs"])
+        costed_p = entry["_cost_first_passed"] / costed_tasks if costed_tasks else 0.0
         expected_cost = (
-            measured_cost / first_try_rate
-            if measured_cost is not None and first_try_rate > 0
+            (sum(entry["_costs"]) / entry["_cost_attempts"]) / costed_p
+            if measured_cost is not None and entry["_cost_attempts"] and costed_p > 0
             else None
         )
         tier = (

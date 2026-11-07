@@ -357,6 +357,20 @@ class MeasuredCostTests(unittest.TestCase):
         self.assertAlmostEqual(0.25, item["measured_cost_per_task"])
         self.assertAlmostEqual(0.50, item["expected_cost_per_verified_pass"])
 
+    def test_cost_is_per_attempt_not_summed_running_totals(self) -> None:
+        # cost_usd on each row is the task's RUNNING total (_refresh_cost), so
+        # attempt 1 = 0.10 and attempt 2 = 0.30 means the task cost 0.30, not 0.40.
+        first = row("t-r", model="openrouter/a/retry", engine="opencode")
+        first.update(task_key="t0", verdict="FAIL", cost_usd=0.10, logged_at="2026-10-01T10:00:00+00:00")
+        second = row("t-r", model="openrouter/a/retry", engine="opencode")
+        second.update(task_key="t0", verdict="PASS", retry=True, cost_usd=0.30, logged_at="2026-10-01T10:05:00+00:00")
+        third = row("t-s", model="openrouter/a/retry", engine="opencode")
+        third.update(task_key="t1", verdict="PASS", cost_usd=0.10, logged_at="2026-10-01T11:00:00+00:00")
+        item = aggregate_model_scoreboard_rows([first, second, third])[0]
+        self.assertAlmostEqual(0.20, item["measured_cost_per_task"])  # (0.30 + 0.10) / 2
+        # c per attempt = 0.40 / 3 attempts; p = 1/2 first-try; no second division by p.
+        self.assertAlmostEqual((0.40 / 3) / 0.5, item["expected_cost_per_verified_pass"])
+
     def test_no_measured_cost_or_plan_billed_engine_has_none(self) -> None:
         plain = aggregate_model_scoreboard_rows(self.rows("opencode", "openrouter/a/none", [None, None], [True, True]))[0]
         self.assertIsNone(plain["measured_cost_per_task"])
