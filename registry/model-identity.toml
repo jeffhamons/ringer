@@ -23,6 +23,7 @@ lab = "OpenAI"
 confidence = "verified"     # snapshot gpt-5.5-2026-04-23, Codex CLI default; see capability file
 source = "https://developers.openai.com/codex/models"
 last_verified = 2026-07-10
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-5.5", "opencode:openrouter/openai/gpt-5.5-pro", "opencode:openrouter/openai/gpt-5.5:batch", "opencode:openrouter/openai/gpt-5.5-pro:batch"]
 
 [engines.codex.models."gpt-5.6-sol"]
 display = "GPT-5.6 Sol"
@@ -30,6 +31,7 @@ lab = "OpenAI"
 confidence = "verified"
 source = "https://developers.openai.com/codex/models"
 last_verified = 2026-07-10
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-5.6-sol", "opencode:openrouter/openai/gpt-5.6-sol-pro", "opencode:openrouter/openai/gpt-5.6-sol:batch", "opencode:openrouter/openai/gpt-5.6-sol-pro:batch"]
 
 [engines.codex.models."gpt-5.6-luna"]
 display = "GPT-5.6 Luna"
@@ -37,6 +39,7 @@ lab = "OpenAI"
 confidence = "verified"
 source = "https://developers.openai.com/codex/models"
 last_verified = 2026-07-10
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-5.6-luna", "opencode:openrouter/openai/gpt-5.6-luna-pro", "opencode:openrouter/openai/gpt-5.6-luna:batch", "opencode:openrouter/openai/gpt-5.6-luna-pro:batch"]
 
 [engines.codex.models."gpt-5.6-terra"]
 display = "GPT-5.6 Terra"
@@ -44,6 +47,7 @@ lab = "OpenAI"
 confidence = "verified"
 source = "https://developers.openai.com/codex/models"
 last_verified = 2026-07-10
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-5.6-terra", "opencode:openrouter/openai/gpt-5.6-terra-pro", "opencode:openrouter/openai/gpt-5.6-terra:batch", "opencode:openrouter/openai/gpt-5.6-terra-pro:batch"]
 
 [engines.codex.models."gpt-6.1-sol"]
 # Codex runs under the ChatGPT harness only; the OpenRouter route is guarded.
@@ -51,13 +55,30 @@ display = "GPT-6.1 Sol"
 lab = "OpenAI"
 confidence = "unverified"
 last_verified = 2026-11-07
-noncanonical_slugs = ["opencode:openrouter/openai/gpt-6.1-sol"]
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-6.1-sol", "opencode:openrouter/openai/gpt-6.1-sol-pro", "opencode:openrouter/openai/gpt-6.1-sol:batch", "opencode:openrouter/openai/gpt-6.1-sol-pro:batch"]
 
 [engines.codex.models."gpt-6-astra"]
 display = "GPT-6 Astra"
 lab = "OpenAI"
 confidence = "unverified"
 last_verified = 2026-11-07
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-6-astra", "opencode:openrouter/openai/gpt-6-astra-pro", "opencode:openrouter/openai/gpt-6-astra:batch", "opencode:openrouter/openai/gpt-6-astra-pro:batch"]
+
+[engines.codex.models."gpt-6-sol"]
+# Retired for routing; kept so the OpenRouter route is guarded and history resolves.
+display = "GPT-6 Sol"
+lab = "OpenAI"
+confidence = "unverified"
+last_verified = 2026-11-07
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-6-sol", "opencode:openrouter/openai/gpt-6-sol-pro", "opencode:openrouter/openai/gpt-6-sol:batch", "opencode:openrouter/openai/gpt-6-sol-pro:batch"]
+
+[engines.codex.models."gpt-6-luna"]
+# Retired for routing; kept so the OpenRouter route is guarded and history resolves.
+display = "GPT-6 Luna"
+lab = "OpenAI"
+confidence = "unverified"
+last_verified = 2026-11-07
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-6-luna", "opencode:openrouter/openai/gpt-6-luna-pro", "opencode:openrouter/openai/gpt-6-luna:batch", "opencode:openrouter/openai/gpt-6-luna-pro:batch"]
 
 [engines.grok]
 harness = "Grok Build CLI"
@@ -92,6 +113,14 @@ lab = "xAI"
 confidence = "verified"
 source = "https://docs.x.ai/developers/release-notes"
 last_verified = 2026-08-01
+
+[engines.grok.models."grok-4.7"]
+# Runs on the Grok Build CLI plan; the OpenRouter route is guarded.
+display = "Grok 4.7"
+lab = "xAI"
+confidence = "unverified"
+last_verified = 2026-11-07
+noncanonical_slugs = ["opencode:openrouter/x-ai/grok-4.7", "opencode:openrouter/x-ai/grok-4.7:batch"]
 
 [engines.opencode]
 harness = "OpenCode"
