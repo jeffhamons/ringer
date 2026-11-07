@@ -485,3 +485,28 @@ class NewFieldTypeStrictnessTests(unittest.TestCase):
         task = TaskSpec.from_obj(self._task())
         self.assertEqual(2, task.max_attempts)
         self.assertFalse(task.redact_spec)
+
+
+class OneRequestManifestModelTests(unittest.TestCase):
+    def _manifest(self, engine: str, model: str | None):
+        packet = ringer.ContextPacket(
+            text="question", packet_bytes=8, source_bytes=0, selected=(), skipped=()
+        )
+        return ringer.one_request_manifest(
+            packet=packet,
+            workdir=Path("/tmp/ask-model-test"),
+            engine=engine,
+            timeout_s=60,
+            reasoning_effort="low",
+            model=model,
+            redact=False,
+        )
+
+    def test_opencode_accepts_model_and_sets_task_model(self) -> None:
+        manifest = self._manifest("opencode", "openrouter/deepseek/v4.1-flash")
+        self.assertEqual("openrouter/deepseek/v4.1-flash", manifest.tasks[0].model)
+        self.assertEqual((), manifest.tasks[0].engine_args)
+
+    def test_other_non_codex_engines_still_reject_model(self) -> None:
+        with self.assertRaises(ValueError):
+            self._manifest("grok", "x")

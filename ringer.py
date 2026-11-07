@@ -13453,8 +13453,8 @@ def one_request_manifest(
     engine_args: list[str] = []
     if engine == DEFAULT_ENGINE_NAME:
         engine_args.extend(("-c", f"model_reasoning_effort={reasoning_effort}"))
-    elif model:
-        raise ValueError("--model is currently supported only by the codex engine")
+    elif model and engine != "opencode":
+        raise ValueError("--model is supported only by the codex and opencode engines")
     return Manifest(
         run_name="one-request",
         workdir=workdir,
@@ -14202,7 +14202,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ENGINE_NAME,
         help=f"worker engine (default: {DEFAULT_ENGINE_NAME})",
     )
-    ask_parser.add_argument("--model", help="Codex model override")
+    ask_parser.add_argument("--model", help="Model override (codex, or an opencode model slug)")
     ask_parser.add_argument(
         "--reasoning-effort",
         choices=("minimal", "low", "medium", "high"),
