@@ -314,7 +314,12 @@ class OpencodeVariantEffortTests(unittest.TestCase):
             (["opencode", "run", "--variant", "max", "x"], "max"),
             (["opencode", "run", "--variant=low", "x"], "low"),
             (["opencode", "run", "--variant", "high"], "high"),
-            (["opencode", "run", "--variant", "bogus"], None),
+            # Any non-empty value is recorded, so an unknown variant still
+            # identifies its own slot instead of pooling with the default.
+            (["opencode", "run", "--variant", "xhigh"], "xhigh"),
+            (["opencode", "run", "--variant=minimal", "x"], "minimal"),
+            (["opencode", "run", "--variant", "--print-logs"], None),
+            (["opencode", "run", "--variant="], None),
             (["opencode", "run", "--variant"], None),
             (["opencode", "run"], None),
             (["codex", "-c", "model_reasoning_effort=high"], "high"),

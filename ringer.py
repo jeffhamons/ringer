@@ -12796,18 +12796,20 @@ def effective_model_from_command(command: list[str]) -> str:
     return ""
 
 
-OPENCODE_VARIANTS = ("low", "high", "max")
 
 
 def effective_reasoning_effort_from_command(command: list[str]) -> str | None:
     """Return an explicitly configured model reasoning effort from worker argv."""
     for index, item in enumerate(command):
+        # Record any non-empty value (low/high/max are only the known ones).
         if item == "--variant" and index + 1 < len(command):
-            if command[index + 1] in OPENCODE_VARIANTS:
-                return command[index + 1]
+            value = command[index + 1].strip()
+            if value and not value.startswith("-"):
+                return value
         elif item.startswith("--variant="):
-            if item.removeprefix("--variant=") in OPENCODE_VARIANTS:
-                return item.removeprefix("--variant=")
+            value = item.removeprefix("--variant=").strip()
+            if value:
+                return value
     for item in command:
         match = re.search(
             r"(?:^|[=,\s])model_reasoning_effort\s*=\s*[\"']?([^\"',\s]+)",
