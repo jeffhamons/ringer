@@ -274,9 +274,11 @@ There is no default model. Do not pick from memory or from a candidate list.
    rung; retry the same model once only for infra, flakiness or a fixed spec or
    checker bug. Do not re-ask Jeff per job when the rung is SUPPORTED or a
    Jeff-approved unexpired PROVISIONAL.
-3. DeepSeek V4.1 Flash runs at max effort (`--variant max`) on every rung; max is a blocked default until the A1 max lanes run clean (one transient opencode server error seen 2026-11-07), and `high` is a labeled fallback, never a silent substitute. Effort is not a
-   step-up: a first-try failure steps straight to the next model. Record
-   effort with `engine_args ["--variant", "high"]`.
+3. DeepSeek V4.1 Flash's intended effort is max, but max is a blocked default until the A1 max lanes
+   run clean (an opencode server fault, not evidence against max). Until then pass
+   `engine_args ["--variant", "high"]` and state "effort high (fallback; max blocked)" at launch;
+   switch to `max` when routing.toml unblocks it. Effort is not a step-up: a first-try
+   failure steps straight to the next model.
 4. Cross-cutting step-up is Grok while it has quota; on ENGINE_DOWN or quota
    errors go to Codex (OpenAI harness) or Opus 5.5 (Claude harness). Codex
    means only gpt-6.1-sol on the ChatGPT harness, never through opencode. Codex
@@ -308,7 +310,8 @@ exploration candidate from `./ringer.py models --explore --task-type <type>`
 (untested + cheap or free, text-capable, decent context). Free promos from
 `catalog --changes` jump the queue — a temporarily-free model is a zero-cost
 experiment. Never explore on time-critical work, never with more than a
-small slice of a batch, and state the experiment at launch. Promotion ladder (computed by --explore):
+small slice of a batch, and name the experiment when presenting the engine
+ask so the human can veto it. Promotion ladder (computed by --explore):
 untested → probation (some evidence) → proven for a task_type. "Proven"
 means SUPPORTED: n ≥ 8 and the 80% Wilson lower bound of the first-try rate
 is ≥ 0.45; volume alone never proves a model. Proven models earn bigger lanes in that type and an
