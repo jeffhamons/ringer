@@ -124,6 +124,49 @@ class CodexCommandPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "engine_args may not set the model"):
                 self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
 
+    def test_attached_and_equals_model_forms_in_engine_args_are_rejected(self) -> None:
+        cases = (
+            ["-m", "gpt-6.1-sol", "-mgpt-5.5"],
+            ["-mgpt-5.5"],
+            ["-cmodel=gpt-5.5"],
+            ["-c", " model = gpt-5.5"],
+            ["--config=model=gpt-5.5"],
+            ["--config= model =gpt-5.5"],
+            ["--config", "model=gpt-5.5"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "engine_args may not set the model"):
+                    self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
+
+    def test_other_config_and_routing_flags_in_engine_args_are_rejected(self) -> None:
+        cases = (
+            ["-c", "model_provider=other"],
+            ["--config=model_provider=other"],
+            ["-cmodel_provider=other"],
+            ["--oss"],
+            ["--profile", "x"],
+            ["--profile=x"],
+            ["-p", "x"],
+            ["-px"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "engine_args may only"):
+                    self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
+
+    def test_command_scan_catches_attached_model_in_template(self) -> None:
+        template = ("-mgpt-5.5",) + CODEX_TEMPLATE
+        with self.assertRaisesRegex(ValueError, "gpt-5.5"):
+            self.check(codex_like(template=template), model="gpt-6.1-sol")
+
+    def test_writable_roots_engine_args_still_allowed(self) -> None:
+        self.check(
+            codex_like(),
+            model="gpt-6.1-sol",
+            engine_args=["-c", 'sandbox_workspace_write.writable_roots=["/tmp/x"]'],
+        )
+
     def test_reasoning_effort_engine_args_still_allowed(self) -> None:
         self.check(codex_like(), model="gpt-6.1-sol", engine_args=["-c", "model_reasoning_effort=low"])
 
