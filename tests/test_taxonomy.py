@@ -31,6 +31,7 @@ from ringer import (  # noqa: E402
     model_scoreboard_status,
     wilson_interval,
     evidence_is_stale,
+    order_model_scoreboard_rows,
     build_models_api_payload,
     create_read_model_schema,
     enrich_model_groups_with_identity,
@@ -336,6 +337,48 @@ class WilsonTierTests(unittest.TestCase):
         self.assertTrue(evidence_is_stale("2026-01-01T00:00:00+00:00", now=now))
         self.assertFalse(evidence_is_stale("2026-10-20T00:00:00+00:00", now=now))
         self.assertFalse(evidence_is_stale("", now=now))
+
+
+class MeasuredCostTests(unittest.TestCase):
+    def rows(self, engine: str, model: str, costs: list[float | None], passes: list[bool]) -> list[dict[str, object]]:
+        out = []
+        for i, (cost, ok) in enumerate(zip(costs, passes)):
+            item = row(f"{model}-{i}", model=model, engine=engine)
+            item["task_key"] = f"t{i}"
+            item["verdict"] = "PASS" if ok else "FAIL"
+            if cost is not None:
+                item["cost_usd"] = cost
+            out.append(item)
+        return out
+
+    def test_measured_cost_per_task_and_per_verified_pass(self) -> None:
+        rows = self.rows("opencode", "openrouter/a/cheap", [0.10, 0.20, 0.30, 0.40], [True, True, False, False])
+        item = aggregate_model_scoreboard_rows(rows)[0]
+        self.assertAlmostEqual(0.25, item["measured_cost_per_task"])
+        self.assertAlmostEqual(0.50, item["expected_cost_per_verified_pass"])
+
+    def test_no_measured_cost_or_plan_billed_engine_has_none(self) -> None:
+        plain = aggregate_model_scoreboard_rows(self.rows("opencode", "openrouter/a/none", [None, None], [True, True]))[0]
+        self.assertIsNone(plain["measured_cost_per_task"])
+        self.assertIsNone(plain["expected_cost_per_verified_pass"])
+        for engine in ("codex", "grok"):
+            plan = aggregate_model_scoreboard_rows(self.rows(engine, "plan-model", [0.5, 0.5], [True, True]))[0]
+            self.assertIsNone(plan["expected_cost_per_verified_pass"], engine)
+
+    def test_zero_first_try_passes_gives_no_expected_cost(self) -> None:
+        item = aggregate_model_scoreboard_rows(self.rows("opencode", "openrouter/a/bad", [0.1, 0.1], [False, False]))[0]
+        self.assertIsNone(item["expected_cost_per_verified_pass"])
+
+    def test_sort_prefers_measured_expected_cost_over_estimator(self) -> None:
+        base = {"tier": "probation", "first_try_pass_rate": 0.5, "pass_rate": 0.5, "engine": "opencode"}
+        cheap = dict(base, model="m-cheap", median_tokens=10**9, expected_cost_per_verified_pass=0.2)
+        dear = dict(base, model="m-dear", median_tokens=1, expected_cost_per_verified_pass=2.0)
+        catalog = {
+            "m-cheap": {"prompt_per_m": 1000, "completion_per_m": 1000},
+            "m-dear": {"prompt_per_m": 1, "completion_per_m": 1},
+        }
+        ordered = order_model_scoreboard_rows([dear, cheap], catalog)
+        self.assertEqual(["m-cheap", "m-dear"], [r["model"] for r in ordered])
 
 
 if __name__ == "__main__":

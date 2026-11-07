@@ -9325,6 +9325,7 @@ def catalog_identity_fields(
 # Evidence status per (model, effort) slot: 80% Wilson interval of the
 # first-try rate against a quality floor, one rule for every caller.
 WILSON_Z_80 = 1.2816
+PLAN_BILLED_ENGINES = frozenset({"codex", "grok"})
 EVIDENCE_MIN_TASKS = 8
 EVIDENCE_QUALITY_FLOOR = 0.45
 EVIDENCE_STALE_DAYS = 90
@@ -9423,6 +9424,7 @@ def aggregate_model_scoreboard_rows(
                 "last_seen": "",
                 "_duration_ms": [],
                 "_tokens": [],
+                "_costs": [],
                 "_task_types": {},
             },
         )
@@ -9490,6 +9492,7 @@ def aggregate_model_scoreboard_rows(
                 "last_seen": "",
                 "_duration_ms": [],
                 "_tokens": [],
+                "_costs": [],
                 "_task_types": {},
             },
         )
@@ -9525,6 +9528,14 @@ def aggregate_model_scoreboard_rows(
             tokens = model_log_int(row.get("worker_tokens"))
             if tokens is not None:
                 model_entry["_tokens"].append(tokens)
+        task_costs = [
+            float(row["cost_usd"])
+            for row in ordered
+            if isinstance(row.get("cost_usd"), (int, float))
+            and not isinstance(row.get("cost_usd"), bool)
+        ]
+        if task_costs:
+            model_entry["_costs"].append(sum(task_costs))
 
     finalized: list[dict[str, Any]] = []
     for entry in models.values():
@@ -9547,6 +9558,17 @@ def aggregate_model_scoreboard_rows(
             )
         breakdown_rows.sort(key=lambda item: (-item["tasks"], item["task_type"]))
         first_try_rate = entry["first_try_passed"] / tasks_count if tasks_count else 0.0
+        # Plan-billed engines log no real dollars and are never ranked on cost.
+        measured_cost = (
+            sum(entry["_costs"]) / len(entry["_costs"])
+            if entry["_costs"] and entry["engine"] not in PLAN_BILLED_ENGINES
+            else None
+        )
+        expected_cost = (
+            measured_cost / first_try_rate
+            if measured_cost is not None and first_try_rate > 0
+            else None
+        )
         tier = (
             "unranked"
             if entry["unattributed"] or (entry["invalidated_rows"] and not tasks_count)
@@ -9561,6 +9583,8 @@ def aggregate_model_scoreboard_rows(
                 "unattributed": entry["unattributed"],
                 "invalidated_only": bool(entry["invalidated_rows"] and not tasks_count),
                 "tier": tier,
+                "measured_cost_per_task": measured_cost,
+                "expected_cost_per_verified_pass": expected_cost,
                 "evidence_status": model_scoreboard_status(tasks_count, first_try_rate),
                 "evidence_stale": evidence_is_stale(entry["last_seen"]),
                 "tasks": tasks_count,
@@ -9596,6 +9620,10 @@ def estimated_task_cost(row: dict[str, Any], catalog_model: dict[str, Any] | Non
 
 
 def model_sort_cost(row: dict[str, Any], catalog_model: dict[str, Any] | None) -> float:
+    # Measured dollars per verified pass beat the catalog estimator.
+    measured = row.get("expected_cost_per_verified_pass")
+    if isinstance(measured, (int, float)):
+        return float(measured)
     cost = estimated_task_cost(row, catalog_model)
     if cost is not None:
         return cost
@@ -9691,6 +9719,9 @@ def source_file_link(path: Path, label: str) -> str:
 
 
 def model_task_cost_label(row: dict[str, Any], catalog_model: dict[str, Any] | None) -> str:
+    measured = row.get("measured_cost_per_task")
+    if isinstance(measured, (int, float)):
+        return fmt_short_task_cost(float(measured))
     median_tokens = row.get("median_tokens")
     if median_tokens is None:
         return "in plan"
