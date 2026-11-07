@@ -65,6 +65,31 @@ class LintManifestTests(unittest.TestCase):
     def assertHasFinding(self, findings: list[str], expected: str) -> None:
         self.assertIn(expected, findings, f"expected lint finding not found: {expected}\nfindings: {findings}")
 
+    def lint_type(self, task_type: str) -> list[str]:
+        task = self.task()
+        task["task_type"] = task_type
+        return lint_manifest(self.manifest([task]))
+
+    def test_alias_task_type_warns_with_canonical_name(self) -> None:
+        for alias, canonical in [("code_fix", "code-fix"), ("bugfix", "code-fix"), ("code-build", "code-feature"), ("review", "code-review")]:
+            findings = self.lint_type(alias)
+            self.assertTrue(
+                any(f"task_type {alias!r}" in f and canonical in f and not f.startswith("ERROR") for f in findings),
+                (alias, findings),
+            )
+
+    def test_unknown_task_type_warns_but_canonical_and_empty_do_not(self) -> None:
+        self.assertTrue(any("task_type 'mystery-work'" in f for f in self.lint_type("mystery-work")))
+        for ok in ("code-fix", "docs", "bakeoff", "one-request", ""):
+            self.assertFalse(any("task_type" in f for f in self.lint_type(ok)), ok)
+
+    def test_task_type_is_never_rewritten(self) -> None:
+        task = self.task()
+        task["task_type"] = "bugfix"
+        manifest = self.manifest([task])
+        lint_manifest(manifest)
+        self.assertEqual("bugfix", manifest.tasks[0].task_type)
+
     def test_task_fields_must_be_strings(self) -> None:
         with self.assertRaisesRegex(ValueError, r"task one: check must be a string"):
             self.manifest([self.task(check=["cmd1", "cmd2"])])  # type: ignore[arg-type]

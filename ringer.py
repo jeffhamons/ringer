@@ -2125,6 +2125,23 @@ def worker_unwritable_paths(task: TaskSpec, manifest: Manifest) -> list[str]:
     return offenders
 
 
+# Closed task-type vocabulary. Lint only warns; nothing is rewritten or rejected.
+CANONICAL_TASK_TYPES = frozenset({
+    "code-fix", "code-feature", "code-review", "docs", "research", "probe",
+    "test-hardening", "bakeoff", "image-gen", "copywriting", "data-pipeline",
+    "site-build", "persona-review", "motion-design", "commitment-verification",
+    "backlog-triage", "triage", "planning", "one-request",
+})
+TASK_TYPE_ALIASES = {
+    "code_fix": "code-fix", "bugfix": "code-fix", "code-bugfix": "code-fix",
+    "code-edit": "code-fix", "code-change": "code-fix",
+    "code_feature": "code-feature", "code-build": "code-feature", "code": "code-feature",
+    "code_review": "code-review", "review": "code-review",
+    "adversarial-review": "code-review", "code-verification": "code-review",
+    "cross-cutting-review": "code-review",
+}
+
+
 def lint_manifest(
     manifest: Manifest,
     *,
@@ -2160,6 +2177,16 @@ def lint_manifest(
                     f"args_template. Add {{engine_args}} to engines.{task.engine}.args_template "
                     "in config.toml, or remove the field."
                 )
+        if task.task_type in TASK_TYPE_ALIASES:
+            findings.append(
+                f"{task.key}: task_type {task.task_type!r} is an alias; use "
+                f"{TASK_TYPE_ALIASES[task.task_type]!r} so the model log buckets it with the rest."
+            )
+        elif task.task_type and task.task_type not in CANONICAL_TASK_TYPES:
+            findings.append(
+                f"{task.key}: task_type {task.task_type!r} is not in the known list "
+                f"({', '.join(sorted(CANONICAL_TASK_TYPES))}); it will be its own bucket in the model log."
+            )
         if task.task_type in ticketed_types and not task.ticket:
             findings.append(
                 f"{task.key}: {task.task_type} names no ticket, so its cost and outcome "
