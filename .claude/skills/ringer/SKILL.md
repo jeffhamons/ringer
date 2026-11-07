@@ -270,13 +270,18 @@ There is no default model. Do not pick from memory or from a candidate list.
 2. Read the routing file and run rung 1 for that class and task type when it is
    SUPPORTED, or PROVISIONAL, Jeff-approved and unexpired. Apply the same test
    to every step-up rung. A CONTRADICTED or expired slot is not used; report
-   "needs Jeff" with the data.
+   "needs Jeff" with the data. After a substantive check failure step up one
+   rung; retry the same model once only for infra, flakiness or a fixed spec or
+   checker bug. Do not re-ask Jeff per job when the rung is SUPPORTED or a
+   Jeff-approved unexpired PROVISIONAL.
 3. DeepSeek V4.1 Flash runs at max effort on every rung. Effort is not a
    step-up: a first-try failure steps straight to the next model. Record
    effort with `engine_args ["--variant", "max"]`.
 4. Cross-cutting step-up is Grok while it has quota; on ENGINE_DOWN or quota
    errors go to Codex (OpenAI harness) or Opus 5.5 (Claude harness). Codex
-   always runs on the ChatGPT harness and never through opencode. Under a
+   means only gpt-6.1-sol on the ChatGPT harness, never through opencode. Codex
+   and Grok are for planning and checking, except the step-up seats the routing
+   file lists. Under a
    Claude orchestrator the Codex seat is Opus 5.5 through the opencode engine
    (its OpenRouter slug). That seat is not the merge gate.
 5. Never put a cheap rung on a weak check; the check decides what first-try
@@ -288,20 +293,12 @@ There is no default model. Do not pick from memory or from a candidate list.
    the executed check, never by self-report. Audition spend stops at the cap
    Jeff set.
 
-**The engine choice belongs to the human — but the recommendation comes
-from THEIR evidence.** Before the FIRST run of a job: read what's wired up
-(`[engines.<name>]` blocks in `~/.config/ringer/config.toml`), run
-`./ringer.py models --task-type <this job's type>` for the local scoreboard,
-and glance at `./ringer.py catalog --changes` for anything newly free or
-newly cheap. Then ask the user which model should do the typing — top 2–3
-options with the NUMBERS in the pitch and a recommendation, e.g.: *"GLM is
-6/6 first-try on persona work here at ~2¢/task — recommended. Codex is also
-100% but ~8x the tokens. And a newly cheap catalog entry is untested — want
-it auditioning one of the small tasks?"* Honor their pick via the per-task
-`engine`/`model` fields; don't re-ask every round of the same job unless
-the mix isn't working. This is per-user by design: the scoreboard learns
-THIS user's workload — never import another machine's conclusions or
-recommend from a different user's numbers.
+**Read `routing.toml`; ask only for non-runnable rungs.** Do not pitch models
+or re-ask Jeff per job: when the rung is SUPPORTED, or a Jeff-approved
+unexpired PROVISIONAL, launch it and state the choice. Ask only when a rung is
+not runnable (UNTESTED, CONTRADICTED, expired or unapproved), with the numbers.
+The scoreboard learns THIS user's workload; never import another machine's
+conclusions.
 
 **Explore or the scoreboard fossilizes.** Always recommending the proven
 pick means never learning a new one. In any run of 3+ tasks that has a
