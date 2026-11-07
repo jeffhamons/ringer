@@ -32,7 +32,9 @@ from ringer import (  # noqa: E402
     WorkerResult,
     verdict_for,
     worker_never_ran,
+    worker_zero_token_early_exit,
 )
+from ringer import EngineConfig, load_engines  # noqa: E402
 
 
 def toml_string(value: object) -> str:
@@ -91,6 +93,35 @@ class WorkerNeverRanTests(unittest.TestCase):
         worker = WorkerResult(returncode=None, timed_out=True, tokens=None)
         self.assertFalse(worker_never_ran(worker))
         self.assertEqual("TIMEOUT", verdict_for(worker, FAILING_VERIFY))
+
+
+class ZeroTokenEarlyExitTests(unittest.TestCase):
+    """A fast, tokenless, non-timeout failure on a token-reporting engine is
+    infrastructure evidence (kept out of the model log); grok is exempt."""
+
+    def engine(self, name: str, *, reports_tokens: bool = True) -> tuple[str, EngineConfig]:
+        engines = load_engines({})
+        base = next(iter(engines.values()))
+        return name, __import__("dataclasses").replace(
+            base, token_regex=r"tokens used:?\s*([0-9,]+)" if reports_tokens else None, token_format=None
+        )
+
+    def check(self, worker: WorkerResult, name: str = "opencode", *, reports_tokens: bool = True, duration_s: float = 5.0) -> bool:
+        engine_name, engine = self.engine(name, reports_tokens=reports_tokens)
+        return worker_zero_token_early_exit(worker, engine_name, engine, duration_s=duration_s)
+
+    def test_fast_zero_token_failure_is_infra(self) -> None:
+        self.assertTrue(self.check(WorkerResult(returncode=1, timed_out=False, tokens=None)))
+        self.assertTrue(self.check(WorkerResult(returncode=1, timed_out=False, tokens=0)))
+
+    def test_narrow_exclusions(self) -> None:
+        failing = WorkerResult(returncode=1, timed_out=False, tokens=None)
+        self.assertFalse(self.check(failing, "grok"))
+        self.assertFalse(self.check(failing, reports_tokens=False))
+        self.assertFalse(self.check(failing, duration_s=300.0))
+        self.assertFalse(self.check(WorkerResult(returncode=1, timed_out=False, tokens=900)))
+        self.assertFalse(self.check(WorkerResult(returncode=None, timed_out=True, tokens=None)))
+        self.assertFalse(self.check(WorkerResult(returncode=0, timed_out=False, tokens=None)))
 
 
 class SpawnFailureEndToEndTests(unittest.TestCase):

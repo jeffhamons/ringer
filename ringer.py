@@ -11886,7 +11886,15 @@ class RingerRunner:
         verdict: str,
         duration_ms: int,
     ) -> None:
-        if worker_never_ran(worker):
+        if worker_never_ran(worker) or (
+            verdict not in ("PASS", "TIMEOUT")
+            and worker_zero_token_early_exit(
+                worker,
+                runtime.task.engine,
+                self.config.engines.get(runtime.task.engine),
+                duration_s=duration_ms / 1000.0,
+            )
+        ):
             # No model was invoked, so there is no model evidence to log.
             # The task record (run JSON) still carries the full attempt state;
             # only the per-model scoreboard is protected here.
@@ -12176,6 +12184,31 @@ def worker_never_ran(worker: WorkerResult) -> bool:
     if worker.error is not None and worker.returncode is None and not worker.timed_out:
         return True
     return worker.returncode in (126, 127)
+
+
+def worker_zero_token_early_exit(
+    worker: WorkerResult,
+    engine_name: str,
+    engine: EngineConfig | None,
+    *,
+    duration_s: float,
+) -> bool:
+    """True for a fast, tokenless, non-timeout failure on a token-reporting engine.
+
+    Narrow on purpose: grok emits no tokens, so it is exempt; an engine with no
+    token parser tells us nothing; a timeout or a long run is model evidence.
+    Used only to keep the attempt out of the model log (not to change the
+    verdict or trip the spawn-failure circuit breaker).
+    """
+    if engine is None or "grok" in engine_name.lower():
+        return False
+    if not (engine.token_regex or engine.token_format):
+        return False
+    if worker.tokens or worker.timed_out or worker.error is not None:
+        return False
+    if worker.returncode in (None, 0):
+        return False
+    return duration_s <= ENGINE_DOWN_WEAK_MAX_S
 
 
 def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:

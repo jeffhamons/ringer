@@ -226,6 +226,21 @@ class AmendCliTests(unittest.TestCase):
         self.assertEqual(saved[0]["by"], "batcher")
         self.assertNotIn("evil", json.dumps(saved))
 
+    def test_from_file_backfills_several_infra_amendments_at_once(self) -> None:
+        # Documents the backfill path for notes that already claim "not model-quality
+        # evidence": one file, many infra amendments, all recorded or none.
+        batch = [
+            {"run_id": "r1", "task_key": "t1", "attempt": 1, "cause": "infra", "note": "engine returned 400 before any model call"},
+            {"run_id": "r1", "task_key": "t1", "attempt": 2, "cause": "infra", "note": "engine returned 400 before any model call"},
+        ]
+        path = self.root / "backfill.jsonl"
+        path.write_text("\n".join(json.dumps(x) for x in batch) + "\n", encoding="utf-8")
+        proc = self.ringer("amend", "--from-file", str(path), "--identity", "backfill")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        saved = self.amendments()
+        self.assertEqual(2, len(saved))
+        self.assertEqual({"infra"}, {item["cause"] for item in saved})
+
     def test_jsonl_and_sqlite_paths_agree(self) -> None:
         proc = self.ringer("amend", "r1", "t1", "--cause", "check", "--note", "check was broken")
         self.assertEqual(proc.returncode, 0, proc.stderr)
