@@ -258,6 +258,36 @@ Pattern-selection judgment:
 
 ## Engine selection
 
+### Routing file (choose models from evidence, not habit)
+
+Model choice comes from `~/.config/ringer/routing.toml`, keyed by class, task
+type and rung, with the status, n, 80% lower bound and expiry of every slot.
+There is no default model. Do not pick from memory or from a candidate list.
+
+1. Classify the lane before launching: mechanical, scoped, cross-cutting
+   (spec over about 4,000 characters, 3+ contracts or 3+ owned files),
+   judgment (review, plan or spec checking) or research.
+2. Read the routing file and run rung 1 for that class and task type when it is
+   SUPPORTED, or PROVISIONAL, Jeff-approved and unexpired. Apply the same test
+   to every step-up rung. A CONTRADICTED or expired slot is not used; report
+   "needs Jeff" with the data.
+3. DeepSeek V4.1 Flash runs at max effort on every rung. Effort is not a
+   step-up: a first-try failure steps straight to the next model. Record
+   effort with `engine_args ["--variant", "max"]`.
+4. Cross-cutting step-up is Grok while it has quota; on ENGINE_DOWN or quota
+   errors go to Codex (OpenAI harness) or Opus 5.5 (Claude harness). Codex
+   always runs on the ChatGPT harness and never through opencode. Under a
+   Claude orchestrator the Codex seat is Opus 5.5 through the opencode engine
+   (its OpenRouter slug). That seat is not the merge gate.
+5. Never put a cheap rung on a weak check; the check decides what first-try
+   pass means. Review rows from protocol-only checks are not review quality.
+6. Always pass `model` explicitly. At launch state class, rung, slug, effort,
+   status and n. A rung that is not runnable yet runs only as an audition
+   manifest (paired lanes, same spec, same check).
+7. Audition results propose routing-file changes; Jeff approves them. Judge by
+   the executed check, never by self-report. Audition spend stops at the cap
+   Jeff set.
+
 **The engine choice belongs to the human — but the recommendation comes
 from THEIR evidence.** Before the FIRST run of a job: read what's wired up
 (`[engines.<name>]` blocks in `~/.config/ringer/config.toml`), run
@@ -266,7 +296,7 @@ and glance at `./ringer.py catalog --changes` for anything newly free or
 newly cheap. Then ask the user which model should do the typing — top 2–3
 options with the NUMBERS in the pitch and a recommendation, e.g.: *"GLM is
 6/6 first-try on persona work here at ~2¢/task — recommended. Codex is also
-100% but ~8x the tokens. And kimi went free on OpenRouter yesterday — want
+100% but ~8x the tokens. And a newly cheap catalog entry is untested — want
 it auditioning one of the small tasks?"* Honor their pick via the per-task
 `engine`/`model` fields; don't re-ask every round of the same job unless
 the mix isn't working. This is per-user by design: the scoreboard learns
@@ -308,7 +338,7 @@ per task via the manifest `engine` field. Defaults are deliberate:
 - **codex** (default): strongest general worker. Use per-task `engine_args`
   to set reasoning effort — spend it on hard tasks, not boilerplate.
 - **opencode**: the universal lane — any OpenRouter model via the `model`
-  field (engine `model_default` is GLM-5.2, the cheap-intelligence pick).
+  field; the routing file picks the slug. Always name the model explicitly.
   Validate a model new to you with a trivial one-task manifest before
   trusting it with a batch.
 - Small/flash-class models are the first to choke on long conversational or
