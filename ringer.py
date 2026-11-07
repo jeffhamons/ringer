@@ -2144,11 +2144,18 @@ TASK_TYPE_ALIASES = {
 }
 
 
+def is_codex_engine(engine_name: str, engine: EngineConfig | None) -> bool:
+    """True for the engine named codex or any engine whose binary is codex."""
+    if engine_name == DEFAULT_ENGINE_NAME:
+        return True
+    return engine is not None and Path(engine.bin).name == DEFAULT_ENGINE_NAME
+
+
 def codex_model_policy_error(task: TaskSpec, config: AppConfig | None) -> str:
     """Return why a codex task may not run, or "" when its model is allowed."""
-    if task.engine != DEFAULT_ENGINE_NAME:
-        return ""
     engine = config.engines.get(task.engine) if config else None
+    if not is_codex_engine(task.engine, engine):
+        return ""
     model = task.model or (engine.model_default if engine else "")
     allowed = ", ".join(CODEX_ALLOWED_MODELS)
     if not model:
@@ -12995,6 +13002,50 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             )
 
 
+def codex_command_policy_error(task: TaskSpec, engine: EngineConfig) -> str:
+    """Check the argv that will actually run, not just the declared model."""
+    if not is_codex_engine(engine.name, engine):
+        return ""
+    allowed = ", ".join(CODEX_ALLOWED_MODELS)
+
+    def model_override(item: str) -> bool:
+        return item in {"-m", "--model"} or item.startswith("--model=") or bool(
+            re.match(r"\s*model\s*=", item)
+        )
+
+    if any(model_override(item) for item in task.engine_args):
+        return (
+            f"{task.key}: codex engine_args may not set the model (-m/--model/-c model=); "
+            f"the only allowed codex model is {allowed}, set via the task's \"model\" field."
+        )
+    command = build_worker_command(
+        engine,
+        taskdir=Path("."),
+        spec="",
+        full_access=task.full_access,
+        engine_args=task.engine_args,
+        model=task.model,
+    )
+    models = [
+        command[i + 1] if i + 1 < len(command) else ""
+        for i, item in enumerate(command)
+        if item in {"-m", "--model"}
+    ] + [item.removeprefix("--model=") for item in command if item.startswith("--model=")]
+    if not models:
+        return (
+            f"{task.key}: codex command passes no -m model, so ~/.codex/config.toml would "
+            f"pick the model; add {{model_args}} to engines.{engine.name}.args_template "
+            f"(allowed model: {allowed})."
+        )
+    bad = [m for m in models if m not in CODEX_ALLOWED_MODELS]
+    if bad:
+        return (
+            f"{task.key}: codex command would run model {bad[0]!r}; the only allowed "
+            f"codex model is {allowed}."
+        )
+    return ""
+
+
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
     missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
     if missing:
@@ -13004,7 +13055,9 @@ def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
         swallow = claude_list_flag_swallow_message(task)
         if swallow and args_template_puts_spec_after_engine_args(engine.args_template):
             raise ValueError(swallow)
-        policy_error = codex_model_policy_error(task, config)
+        policy_error = codex_model_policy_error(task, config) or codex_command_policy_error(
+            task, engine
+        )
         if policy_error:
             raise ValueError(policy_error)
         requires_model = any("{model}" in item for item in engine.args_template)

@@ -211,8 +211,8 @@ class ModelValidationTests(unittest.TestCase):
         return task
 
     def test_model_on_non_harness_engine_is_rejected(self) -> None:
-        # Not named codex: the codex model policy would reject this first.
-        config = self.config({"plain": replace(codex_like_engine(), name="plain")})
+        # Neither named codex nor running the codex binary: the codex policy does not apply.
+        config = self.config({"plain": replace(codex_like_engine(), name="plain", bin="agent")})
         manifest = self.manifest(self.base_task(engine="plain", model="openrouter/x"))
         with self.assertRaisesRegex(ValueError, "silently ignored"):
             validate_manifest_engines(manifest, config)
@@ -236,7 +236,7 @@ class ModelValidationTests(unittest.TestCase):
     def test_model_args_without_a_resolved_model_is_valid(self) -> None:
         engine = EngineConfig(
             name="plain",
-            bin="codex",
+            bin="agent",
             args_template=("exec", "{model_args}", "{spec}"),
             full_access_args=(),
             sandbox_args=(),

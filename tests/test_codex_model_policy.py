@@ -12,7 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import ringer  # noqa: E402
-from ringer import AppConfig, Manifest, lint_manifest, validate_manifest_engines  # noqa: E402
+from ringer import (  # noqa: E402
+    AppConfig,
+    ArtifactConfig,
+    EngineConfig,
+    EvalConfig,
+    Manifest,
+    lint_manifest,
+    validate_manifest_engines,
+)
 
 SPEC = (
     "Create the requested artifact in the current working directory, keep the change scoped, "
@@ -39,9 +47,96 @@ def make_manifest(root: str, **task_fields: object) -> Manifest:
 
 
 def config_with_default(model_default: str) -> AppConfig:
-    config = AppConfig.load(None)
-    engine = replace(config.engines["codex"], model_default=model_default)
-    return replace(config, engines={**config.engines, "codex": engine})
+    engine = codex_like(model_default=model_default)
+    return synthetic_config(tempfile.gettempdir(), {"codex": engine})
+
+
+def synthetic_config(root: str, engines: dict[str, EngineConfig]) -> AppConfig:
+    base = Path(root)
+    return AppConfig(
+        path=None,
+        identity_default=None,
+        state_dir=base / "state",
+        dashboard_port_base=8787,
+        hud_port=8700,
+        hud_app_path=None,
+        allow_full_access=False,
+        eval=EvalConfig(backend="jsonl", jsonl_path=base / "runs.jsonl"),
+        engines=engines,
+        artifact=ArtifactConfig(
+            enabled=False,
+            out_template=str(base / "live.html"),
+            report_template=str(base / "report.html"),
+            index_out=base / "index.html",
+        ),
+    )
+
+
+CODEX_TEMPLATE = (
+    "exec", "--skip-git-repo-check", "{access_args}", "{model_args}",
+    "{engine_args}", "-C", "{taskdir}", "{spec}",
+)
+
+
+def codex_like(name: str = "codex", template: tuple[str, ...] = CODEX_TEMPLATE, model_default: str = "gpt-6.1-sol") -> EngineConfig:
+    return EngineConfig(
+        name=name,
+        bin="/usr/local/bin/codex",
+        args_template=template,
+        full_access_args=("--dangerously-bypass-approvals-and-sandbox",),
+        sandbox_args=("--sandbox", "workspace-write"),
+        model_default=model_default,
+    )
+
+
+class CodexCommandPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def check(self, engine: EngineConfig, **task_fields: object) -> None:
+        fields = {"engine": engine.name, **task_fields}
+        validate_manifest_engines(
+            make_manifest(self.root, **fields), synthetic_config(self.root, {engine.name: engine})
+        )
+
+    def test_standard_template_with_sol_passes(self) -> None:
+        self.check(codex_like(), model="gpt-6.1-sol")
+
+    def test_template_without_model_args_is_rejected(self) -> None:
+        template = tuple(item for item in CODEX_TEMPLATE if item != "{model_args}")
+        with self.assertRaisesRegex(ValueError, "no -m model"):
+            self.check(codex_like(template=template), model="gpt-6.1-sol")
+
+    def test_hardcoded_model_in_template_is_rejected(self) -> None:
+        template = ("-m", "gpt-5.5") + tuple(i for i in CODEX_TEMPLATE if i != "{model_args}")
+        with self.assertRaisesRegex(ValueError, "gpt-5.5"):
+            self.check(codex_like(template=template), model="gpt-6.1-sol")
+
+    def test_hardcoded_model_beside_model_args_is_rejected(self) -> None:
+        template = ("-m", "gpt-5.5") + CODEX_TEMPLATE
+        with self.assertRaisesRegex(ValueError, "gpt-5.5"):
+            self.check(codex_like(template=template), model="gpt-6.1-sol")
+
+    def test_model_flags_in_engine_args_are_rejected(self) -> None:
+        for args in (["-m", "gpt-5.5"], ["--model", "gpt-5.5"], ["--model=gpt-5.5"], ["-c", "model=gpt-5.5"]):
+            with self.assertRaisesRegex(ValueError, "engine_args may not set the model"):
+                self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
+
+    def test_reasoning_effort_engine_args_still_allowed(self) -> None:
+        self.check(codex_like(), model="gpt-6.1-sol", engine_args=["-c", "model_reasoning_effort=low"])
+
+    def test_policy_applies_to_any_engine_running_the_codex_binary(self) -> None:
+        engine = codex_like(name="codex-fast", model_default="")
+        with self.assertRaisesRegex(ValueError, "gpt-6.1-sol"):
+            self.check(engine, model="gpt-5.5")
+        self.check(engine, model="gpt-6.1-sol")
+        findings = lint_manifest(
+            make_manifest(self.root, engine="codex-fast", model="gpt-5.5"),
+            config=synthetic_config(self.root, {"codex-fast": engine}),
+        )
+        self.assertTrue(any(f.startswith("ERROR:") and "gpt-6.1-sol" in f for f in findings), findings)
 
 
 class CodexModelPolicyTests(unittest.TestCase):
