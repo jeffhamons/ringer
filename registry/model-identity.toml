@@ -7,6 +7,11 @@
 # "unverified" entries are best current knowledge awaiting the capability
 # research pass. Update via PR — this file is loaded into the local read DB.
 
+# ROUTING POLICY (Jeff, 2026-11-07): the Codex engine may only run gpt-6.1-sol
+# (ringer.CODEX_ALLOWED_MODELS; lint and run refuse anything else). Every other
+# codex entry below (gpt-5.5, gpt-5.6-sol/luna/terra, gpt-6-astra) is RETIRED
+# FOR ROUTING and kept only so historical model-log rows still resolve to a
+# display name. Do not treat their presence here as permission to route to them.
 [engines.codex]
 harness = "Codex CLI"
 access = "OAuth plan"
