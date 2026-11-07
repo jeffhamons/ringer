@@ -40,6 +40,20 @@ confidence = "verified"
 source = "https://developers.openai.com/codex/models"
 last_verified = 2026-07-10
 
+[engines.codex.models."gpt-6.1-sol"]
+# Codex runs under the ChatGPT harness only; the OpenRouter route is guarded.
+display = "GPT-6.1 Sol"
+lab = "OpenAI"
+confidence = "unverified"
+last_verified = 2026-11-07
+noncanonical_slugs = ["opencode:openrouter/openai/gpt-6.1-sol"]
+
+[engines.codex.models."gpt-6-astra"]
+display = "GPT-6 Astra"
+lab = "OpenAI"
+confidence = "unverified"
+last_verified = 2026-11-07
+
 [engines.grok]
 harness = "Grok Build CLI"
 access = "OAuth plan"

@@ -218,6 +218,30 @@ source = "fixture"
         secret_row = secret_row[: secret_row.index("</tr>")]
         self.assertIn('class="notes-cell" title=""></td>', secret_row)
 
+    def test_shipped_registry_guards_codex_sol_on_opencode(self) -> None:
+        registry = load_model_identity_registry(ROOT / "registry" / "model-identity.toml")
+        for slug in ("gpt-6.1-sol", "gpt-6-astra"):
+            self.assertIn(("codex", slug), registry.identities)
+        manifest = Manifest.from_obj(
+            {
+                "run_name": "route-test",
+                "workdir": str(self.root / "work"),
+                "tasks": [
+                    {
+                        "key": "sol-task",
+                        "engine": "opencode",
+                        "model": "openrouter/openai/gpt-6.1-sol",
+                        "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                        "check": "test -s output.txt || { echo missing; exit 1; }",
+                        "expect_files": ["output.txt"],
+                        "verified": "output.txt exists",
+                    }
+                ],
+            }
+        )
+        findings = lint_manifest(manifest, identity_registry=registry)
+        self.assertTrue(any("ERROR: sol-task" in item and "gpt-6.1-sol" in item for item in findings), findings)
+
     def test_noncanonical_lint_escape_and_misrouted_credit(self) -> None:
         manifest = Manifest.from_obj(
             {
