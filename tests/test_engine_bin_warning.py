@@ -176,7 +176,8 @@ class EngineBinWarningTests(unittest.TestCase):
             ["--config", str(self.config_path), "lint", str(self.manifest_path)]
         )
 
-        self.assertEqual(1, rc)
+        # A warning-only finding prints but no longer fails lint (only ERROR does).
+        self.assertEqual(0, rc)
         self.assertIn("lint: task-one: spec is probably underspecified", stdout)
         self.assertNotIn("config", stderr.lower())
 

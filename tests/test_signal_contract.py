@@ -334,6 +334,40 @@ source = "fixture"
         chart = html[html.index("<main>") : html.index("</main>")]
         self.assertNotIn("openrouter/x-ai/grok-4.5", chart)
 
+    def test_lint_command_exits_zero_on_warnings_only(self) -> None:
+        manifest_path = self.root / "warn.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_name": "warn-cli",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "alias-task",
+                            "engine": "opencode",
+                            "model": "openrouter/z-ai/glm-5.3",
+                            "task_type": "bugfix",
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "test -s output.txt || { echo missing; exit 1; }",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_registry = ROOT / "registry" / "model-identity.toml"
+        with mock.patch.object(ringer, "default_model_registry_path", return_value=real_registry), mock.patch.object(
+            ringer, "maybe_self_update"
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = ringer.main(["lint", str(manifest_path)])
+        self.assertIn("lint: alias-task: task_type 'bugfix'", output.getvalue())
+        self.assertNotIn("ERROR", output.getvalue())
+        self.assertEqual(0, rc, output.getvalue())
+
     def test_lint_command_reports_error_and_escape_flag_passes(self) -> None:
         manifest_path = self.root / "ringer.json"
         manifest_path.write_text(

@@ -14620,7 +14620,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             if findings:
                 print_lint_findings(findings)
-                return 1
+                # Warnings (task-type aliases and the like) print but do not fail.
+                return 1 if any(f.startswith("ERROR") for f in findings) else 0
             print(f"lint: clean ({len(manifest.tasks)} tasks)")
             return 0
 
