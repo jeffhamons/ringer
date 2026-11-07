@@ -160,6 +160,30 @@ class CodexCommandPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gpt-5.5"):
             self.check(codex_like(template=template), model="gpt-6.1-sol")
 
+    def test_config_model_never_satisfies_the_model_flag_presence_check(self) -> None:
+        base = tuple(i for i in CODEX_TEMPLATE if i != "{model_args}")
+        for prefix in (("-c", "model={model}"), ("--config", "model={model}"), ("-cmodel={model}",)):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(ValueError, "no -m model"):
+                    self.check(codex_like(template=prefix + base), model="gpt-6.1-sol")
+
+    def test_command_scan_catches_config_model_spellings_in_template(self) -> None:
+        for prefix in (("-cmodel=gpt-5.5",), ("-c=model=gpt-5.5",), ("--config=model=gpt-5.5",)):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(ValueError, "gpt-5.5"):
+                    self.check(codex_like(template=prefix + CODEX_TEMPLATE), model="gpt-6.1-sol")
+
+    def test_reasoning_effort_must_be_an_enum_value(self) -> None:
+        for value in ("low", "medium", "high", "xhigh", '"high"', "'low'"):
+            with self.subTest(value=value):
+                self.check(codex_like(), model="gpt-6.1-sol",
+                           engine_args=["-c", f"model_reasoning_effort={value}"])
+        for value in ("low\nmodel=gpt-5.5", "high extra", "turbo", "", "low\n"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "engine_args may only"):
+                    self.check(codex_like(), model="gpt-6.1-sol",
+                               engine_args=["-c", f"model_reasoning_effort={value}"])
+
     def test_writable_roots_engine_args_still_allowed(self) -> None:
         self.check(
             codex_like(),

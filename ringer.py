@@ -13020,7 +13020,8 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
 
 
 CODEX_ALLOWED_CONFIG_RE = re.compile(
-    r"(model_reasoning_effort=|sandbox_workspace_write\.writable_roots=)"
+    r"(model_reasoning_effort=([\"']?)(low|medium|high|xhigh)\2\Z"
+    r"|sandbox_workspace_write\.writable_roots=)"
 )
 
 
@@ -13074,23 +13075,26 @@ def codex_command_policy_error(task: TaskSpec, engine: EngineConfig) -> str:
         if item in {"-m", "--model"}
     ] + [item.removeprefix("--model=") for item in command if item.startswith("--model=")]
     models += [item[2:] for item in command if re.match(r"-m.+", item)]
+    # Only CLI model flags (above) satisfy the presence check; -c/--config
+    # values below feed the rejection list only.
+    config_models: list[str] = []
     for i, item in enumerate(command):
         value = (
             command[i + 1] if item in {"-c", "--config"} and i + 1 < len(command)
-            else item[2:] if item.startswith("-c") and len(item) > 2
+            else item[2:].removeprefix("=") if item.startswith("-c") and len(item) > 2
             else item.removeprefix("--config=") if item.startswith("--config=")
             else ""
         )
         found = re.match(r"\s*model\s*=\s*(.*)", value)
         if found:
-            models.append(found.group(1).strip().strip("\"'"))
+            config_models.append(found.group(1).strip().strip("\"'"))
     if not models:
         return (
             f"{task.key}: codex command passes no -m model, so ~/.codex/config.toml would "
             f"pick the model; add {{model_args}} to engines.{engine.name}.args_template "
             f"(allowed model: {allowed})."
         )
-    bad = [m for m in models if m not in CODEX_ALLOWED_MODELS]
+    bad = [m for m in models + config_models if m not in CODEX_ALLOWED_MODELS]
     if bad:
         return (
             f"{task.key}: codex command would run model {bad[0]!r}; the only allowed "
