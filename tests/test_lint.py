@@ -11,7 +11,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from ringer import Manifest, TaskSpec, Verifier, lint_manifest  # noqa: E402
+from dataclasses import replace  # noqa: E402
+
+from ringer import AppConfig, Manifest, TaskSpec, Verifier, lint_manifest  # noqa: E402
+
+
+def sol_config() -> AppConfig:
+    """Codex policy: tasks that name no model need engines.codex.model_default = gpt-6.1-sol."""
+    config = AppConfig.load(None)
+    engine = replace(config.engines["codex"], model_default="gpt-6.1-sol")
+    return replace(config, engines={**config.engines, "codex": engine})
 
 
 LONG_SPEC = (
@@ -270,7 +279,7 @@ class LintManifestTests(unittest.TestCase):
             worktrees=False,
             max_parallel=3,
         )
-        self.assertEqual([], lint_manifest(manifest))
+        self.assertEqual([], lint_manifest(manifest, config=sol_config()))
 
     def test_verifier_expands_user_expect_files(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -358,7 +367,7 @@ class LintManifestTests(unittest.TestCase):
             ],
             max_parallel=2,
         )
-        self.assertEqual([], lint_manifest(manifest), "compliant manifest should have no lint findings")
+        self.assertEqual([], lint_manifest(manifest, config=sol_config()), "compliant manifest should have no lint findings")
 
     def test_templates_are_clean(self) -> None:
         # Every kit ships one or more manifest skeletons (manifest.json plus
@@ -368,7 +377,7 @@ class LintManifestTests(unittest.TestCase):
         for path in template_paths:
             with self.subTest(template=path.name):
                 manifest = Manifest.from_path(path)
-                findings = lint_manifest(manifest)
+                findings = lint_manifest(manifest, config=sol_config())
                 self.assertEqual([], findings, f"{path} should lint clean, got: {findings}")
 
 

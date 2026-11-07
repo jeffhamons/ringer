@@ -52,6 +52,8 @@ ENV_VAR_PREFIX = "RINGER"
 CONFIG_DIR_NAME = TOOL_NAME
 CONFIG_FILE_NAME = "config.toml"
 DEFAULT_ENGINE_NAME = "codex"
+# Jeff, 2026-11-07: the model should only use 6.1 sol, never weaker or older models.
+CODEX_ALLOWED_MODELS = ("gpt-6.1-sol",)
 DEFAULT_TIMEOUT_S = 900
 # Default budget for running a task's check command. Real build/test suites
 # routinely run 1-5 minutes; a task can raise this via the manifest's
@@ -2142,6 +2144,26 @@ TASK_TYPE_ALIASES = {
 }
 
 
+def codex_model_policy_error(task: TaskSpec, config: AppConfig | None) -> str:
+    """Return why a codex task may not run, or "" when its model is allowed."""
+    if task.engine != DEFAULT_ENGINE_NAME:
+        return ""
+    engine = config.engines.get(task.engine) if config else None
+    model = task.model or (engine.model_default if engine else "")
+    allowed = ", ".join(CODEX_ALLOWED_MODELS)
+    if not model:
+        return (
+            f"{task.key}: codex tasks must name {allowed} (set the task's \"model\" "
+            f"field or engines.codex.model_default); no model is set."
+        )
+    if model not in CODEX_ALLOWED_MODELS:
+        return (
+            f"{task.key}: codex model {model!r} is not allowed; the only allowed "
+            f"codex model is {allowed}."
+        )
+    return ""
+
+
 def lint_manifest(
     manifest: Manifest,
     *,
@@ -2168,6 +2190,9 @@ def lint_manifest(
             findings.append(
                 f"{task.key}: check may fail without printing why; retry prompt and eval log depend on failure output."
             )
+        policy_error = codex_model_policy_error(task, config)
+        if policy_error:
+            findings.append(f"ERROR: {policy_error}")
         if config is not None and task.engine in config.engines:
             dropped = dropped_engine_args(config.engines[task.engine], task.engine_args)
             if dropped:
@@ -14470,8 +14495,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "lint":
             manifest = Manifest.from_path(args.manifest)
             print_engine_bin_diagnostics_if_config_loads(args.config)
+            try:
+                lint_config: AppConfig | None = AppConfig.load(args.config)
+            except Exception:
+                lint_config = None
             findings = lint_manifest(
                 manifest,
+                config=lint_config,
                 allow_noncanonical_route=args.allow_noncanonical_route,
             )
             if findings:
