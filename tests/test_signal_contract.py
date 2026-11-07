@@ -273,6 +273,39 @@ source = "fixture"
             findings = lint_manifest(manifest, identity_registry=registry)
             self.assertTrue(any(f.startswith("ERROR: t") and "noncanonical route" in f for f in findings), (slug, findings))
 
+    def test_route_guard_matches_variant_suffixed_and_cased_slugs(self) -> None:
+        registry = load_model_identity_registry(ROOT / "registry" / "model-identity.toml")
+        slugs = [
+            "openrouter/openai/gpt-6.1-sol:nitro",
+            "openrouter/openai/gpt-6.1-sol:floor",
+            "openrouter/openai/gpt-6.1-sol:online",
+            "openrouter/openai/gpt-5.5:free",
+            "openrouter/x-ai/grok-4.7:nitro",
+            "openrouter/x-ai/grok-4.5:batch",
+            "openrouter/openai/gpt-6.1-sol-pro:thinking",
+            "OpenRouter/OpenAI/GPT-6.1-Sol:Nitro",
+        ]
+        for slug in slugs:
+            manifest = Manifest.from_obj(
+                {
+                    "run_name": "route-test",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "t",
+                            "engine": "opencode",
+                            "model": slug,
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "test -s output.txt || { echo missing; exit 1; }",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            )
+            findings = lint_manifest(manifest, identity_registry=registry)
+            self.assertTrue(any(f.startswith("ERROR: t") and "noncanonical route" in f for f in findings), (slug, findings))
+
     def test_noncanonical_lint_escape_and_misrouted_credit(self) -> None:
         manifest = Manifest.from_obj(
             {

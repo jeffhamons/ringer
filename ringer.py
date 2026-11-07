@@ -8231,6 +8231,27 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
     return ModelIdentityRegistry(identities, defaults, engine_meta, noncanonical_routes)
 
 
+ROUTE_VARIANT_SUFFIXES = (
+    "nitro", "floor", "online", "free", "batch", "thinking", "extended", "exacto",
+)
+
+
+def noncanonical_route_lookup(
+    registry: ModelIdentityRegistry, engine: str, model_key: str
+) -> NoncanonicalRoute | None:
+    """Guard lookup that ignores case and a trailing :variant (:nitro, :free, ...)."""
+    key = model_key.strip().lower()
+    candidates = [model_key, key]
+    head, sep, tail = key.rpartition(":")
+    if sep and tail in ROUTE_VARIANT_SUFFIXES:
+        candidates.append(head)
+    for candidate in candidates:
+        route = registry.noncanonical_routes.get((engine, candidate))
+        if route is not None:
+            return route
+    return None
+
+
 def noncanonical_route_findings(
     manifest: Manifest,
     *,
@@ -8244,7 +8265,7 @@ def noncanonical_route_findings(
         model_key = task.model or (engine.model_default if engine is not None else "")
         if not model_key:
             model_key = identity_registry.defaults.get(task.engine, "")
-        route = identity_registry.noncanonical_routes.get((task.engine, model_key))
+        route = noncanonical_route_lookup(identity_registry, task.engine, model_key)
         if route is None:
             continue
         findings.append(
