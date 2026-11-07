@@ -34,7 +34,7 @@ from ringer import (  # noqa: E402
     worker_never_ran,
     worker_zero_token_early_exit,
 )
-from ringer import AppConfig, EngineConfig, EvalConfig, Manifest, RingerRunner, load_engines  # noqa: E402
+from ringer import AppConfig, ArtifactConfig, EngineConfig, EvalConfig, Manifest, RingerRunner, load_engines  # noqa: E402
 
 
 def toml_string(value: object) -> str:
@@ -134,15 +134,31 @@ class ZeroTokenRowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             log_path = root / "runs.jsonl"
-            config = AppConfig.load(None)
-            engine = replace(
-                config.engines["opencode"], token_regex=r"tokens used:?\s*([0-9,]+)", token_format=None
+            engine = EngineConfig(
+                name="opencode",
+                bin="opencode",
+                args_template=("run", "--model", "{model}", "{spec}"),
+                full_access_args=(),
+                sandbox_args=(),
+                token_regex=r"tokens used:?\s*([0-9,]+)",
+                token_format=None,
             )
-            config = replace(
-                config,
+            config = AppConfig(
+                path=None,
+                identity_default=None,
                 state_dir=root / "state",
+                dashboard_port_base=8787,
+                hud_port=8700,
+                hud_app_path=None,
+                allow_full_access=False,
                 eval=EvalConfig(backend="jsonl", jsonl_path=log_path),
-                engines={**config.engines, "opencode": engine},
+                engines={"opencode": engine},
+                artifact=ArtifactConfig(
+                    enabled=False,
+                    out_template=str(root / "live.html"),
+                    report_template=str(root / "report.html"),
+                    index_out=root / "index.html",
+                ),
             )
             manifest = Manifest.from_obj(
                 {

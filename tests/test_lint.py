@@ -13,14 +13,39 @@ sys.path.insert(0, str(ROOT))
 
 from dataclasses import replace  # noqa: E402
 
-from ringer import AppConfig, Manifest, TaskSpec, Verifier, lint_manifest  # noqa: E402
+import ringer  # noqa: E402
+from ringer import (  # noqa: E402
+    AppConfig,
+    ArtifactConfig,
+    EvalConfig,
+    Manifest,
+    TaskSpec,
+    Verifier,
+    lint_manifest,
+)
 
 
 def sol_config() -> AppConfig:
     """Codex policy: tasks that name no model need engines.codex.model_default = gpt-6.1-sol."""
-    config = AppConfig.load(None)
-    engine = replace(config.engines["codex"], model_default="gpt-6.1-sol")
-    return replace(config, engines={**config.engines, "codex": engine})
+    engine = replace(ringer.built_in_codex_engine(), model_default="gpt-6.1-sol")
+    root = Path(tempfile.gettempdir())
+    return AppConfig(
+        path=None,
+        identity_default=None,
+        state_dir=root / "ringer-lint-state",
+        dashboard_port_base=8787,
+        hud_port=8700,
+        hud_app_path=None,
+        allow_full_access=False,
+        eval=EvalConfig(backend="jsonl", jsonl_path=root / "ringer-lint-runs.jsonl"),
+        engines={"codex": engine},
+        artifact=ArtifactConfig(
+            enabled=False,
+            out_template=str(root / "live.html"),
+            report_template=str(root / "report.html"),
+            index_out=root / "index.html",
+        ),
+    )
 
 
 LONG_SPEC = (
