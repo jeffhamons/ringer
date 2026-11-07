@@ -109,6 +109,34 @@ class AskCommandTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_ask_refuses_noncanonical_opencode_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            worker = root / "worker.py"
+            worker.write_text("print('should never run')\n", encoding="utf-8")
+            config = self.write_config(root, worker, engine_name="opencode")
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    '"{spec}",', '"{model_args}",\n  "{spec}",'
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(ringer, "preflight_engine_bins") as preflight:
+                proc = self.run_in_process(
+                    [
+                        "--config", str(config),
+                        "ask", "What now?",
+                        "--engine", "opencode",
+                        "--model", "openrouter/openai/gpt-6.1-sol",
+                        "--workdir", str(root / "request"),
+                    ],
+                    home=root,
+                )
+            self.assertNotEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            self.assertIn("noncanonical route", proc.stdout + proc.stderr)
+            preflight.assert_not_called()
+            self.assertFalse((root / "request" / "answer").exists())
+
     def test_dry_run_selects_source_without_spawning_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temp_root:
             root = Path(temp_root)

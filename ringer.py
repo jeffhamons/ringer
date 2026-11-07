@@ -13689,6 +13689,14 @@ def run_one_request(config: AppConfig, args: argparse.Namespace) -> int:
         model=args.model,
         redact=args.redact,
     )
+    lint_findings = lint_manifest(
+        manifest,
+        config=config,
+        allow_noncanonical_route=bool(getattr(args, "allow_noncanonical_route", False)),
+    )
+    print_lint_findings(lint_findings)
+    if any(finding.startswith("ERROR:") for finding in lint_findings):
+        return 1
     validate_manifest_engines(manifest, config)
     preflight_engine_bins(manifest, config)
     identity = resolve_identity(
