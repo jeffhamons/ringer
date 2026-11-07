@@ -291,6 +291,30 @@ class CodexModelPolicyTests(unittest.TestCase):
         self.assertEqual("gpt-6.1-sol", build("gpt-6.1-sol").tasks[0].model)
         self.assertEqual("", build(None).tasks[0].model)
 
+    def test_every_ask_effort_choice_passes_validation(self) -> None:
+        packet = ringer.ContextPacket(
+            text="q", packet_bytes=1, source_bytes=0, selected=(), skipped=()
+        )
+        self.assertIn("minimal", ringer.ASK_REASONING_EFFORT_CHOICES)
+        for effort in ringer.ASK_REASONING_EFFORT_CHOICES:
+            manifest = ringer.one_request_manifest(
+                packet=packet,
+                workdir=Path(self.root),
+                engine="codex",
+                timeout_s=60,
+                reasoning_effort=effort,
+                model="gpt-6.1-sol",
+                redact=False,
+            )
+            validate_manifest_engines(manifest, config_with_default("gpt-6.1-sol"))
+
+    def test_effort_allowlist_still_rejects_bad_values(self) -> None:
+        rx = ringer.CODEX_ALLOWED_CONFIG_RE
+        for good in ("minimal", "low", "medium", "high", "xhigh"):
+            self.assertTrue(rx.match(f"model_reasoning_effort={good}"), good)
+        for bad in ("max", "none", "lowx", "low,model=x", ""):
+            self.assertFalse(rx.match(f"model_reasoning_effort={bad}"), bad)
+
 
 if __name__ == "__main__":
     unittest.main()

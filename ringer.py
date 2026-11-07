@@ -13019,8 +13019,11 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             )
 
 
+CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+ASK_REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high")
+
 CODEX_ALLOWED_CONFIG_RE = re.compile(
-    r"(model_reasoning_effort=([\"']?)(low|medium|high|xhigh)\2\Z"
+    r"(model_reasoning_effort=([\"']?)(" + "|".join(CODEX_REASONING_EFFORTS) + r")\2\Z"
     r"|sandbox_workspace_write\.writable_roots=)"
 )
 
@@ -14551,7 +14554,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--model", help="Model override (codex, or an opencode model slug)")
     ask_parser.add_argument(
         "--reasoning-effort",
-        choices=("minimal", "low", "medium", "high"),
+        choices=ASK_REASONING_EFFORT_CHOICES,
         default="low",
         help="Codex reasoning effort (default: low)",
     )
