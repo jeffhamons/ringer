@@ -83,9 +83,11 @@ bin = "codex"
 # - {access_args}: expands to sandbox_args or full_access_args
 # - {model_args}: expands to "-m <model>" only when the manifest task sets
 #   "model" or this engine sets model_default; otherwise it expands to nothing,
-#   preserving Codex's configured default. Setting model_default = "gpt-5.6-sol"
-#   pins the model instead of inheriting ~/.codex/config.toml drift and makes
-#   scoreboard attribution exact.
+#   preserving Codex's configured default. Codex tasks may only run
+#   gpt-6.1-sol (lint and run refuse any other model, and a codex task with no
+#   model at all), so set model_default = "gpt-6.1-sol". That also pins the
+#   model instead of inheriting ~/.codex/config.toml drift and makes scoreboard
+#   attribution exact.
 # - {engine_args}: expands to the task's optional "engine_args" list — the orchestrator
 #   sets per-task flags here, e.g. ["-c", "model_reasoning_effort=medium"] to match
 #   reasoning depth to task difficulty instead of inheriting the CLI-wide default
@@ -103,6 +105,9 @@ args_template = [
 # Never rely on an engine's default sandbox. Be explicit.
 sandbox_args = ["--sandbox", "workspace-write"]
 full_access_args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+# Codex policy: gpt-6.1-sol is the only allowed model.
+model_default = "gpt-6.1-sol"
 
 # First capture group should be the integer token count.
 token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
@@ -180,9 +185,9 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 
 # OpenCode + OpenRouter — the universal model harness. One engine block runs
 # ANY OpenRouter-served model: the {model} placeholder is filled per task from
-# the manifest's "model" field, falling back to model_default below. Example
-# default: GLM-5.2 (z-ai/glm-5.2, roughly $0.74/M input, $2.33/M output as of
-# 2026-07) — the cheap-intelligence lane.
+# the manifest's "model" field (or `ringer ask --model`). There is no default
+# model on purpose: an opencode task with no model is refused, so every job
+# names its model explicitly.
 # OpenCode has no OS sandbox, so `bin` points at engines/opencode-sandboxed.sh
 # (macOS Seatbelt: network + reads open, writes confined to the task dir, a
 # per-run scratch dir, and OpenCode's state/config dirs). Auth: put your
@@ -193,7 +198,6 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 # Uncomment and set an absolute path for `bin` to enable.
 # [engines.opencode]
 # bin = "/absolute/path/to/ringer/engines/opencode-sandboxed.sh"
-# model_default = "openrouter/z-ai/glm-5.2"
 # args_template = [
 #   "{taskdir}",
 #   "{access_args}",

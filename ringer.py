@@ -52,6 +52,8 @@ ENV_VAR_PREFIX = "RINGER"
 CONFIG_DIR_NAME = TOOL_NAME
 CONFIG_FILE_NAME = "config.toml"
 DEFAULT_ENGINE_NAME = "codex"
+# Jeff, 2026-11-07: the model should only use 6.1 sol, never weaker or older models.
+CODEX_ALLOWED_MODELS = ("gpt-6.1-sol",)
 DEFAULT_TIMEOUT_S = 900
 # Default budget for running a task's check command. Real build/test suites
 # routinely run 1-5 minutes; a task can raise this via the manifest's
@@ -2125,6 +2127,50 @@ def worker_unwritable_paths(task: TaskSpec, manifest: Manifest) -> list[str]:
     return offenders
 
 
+# Closed task-type vocabulary. Lint only warns; nothing is rewritten or rejected.
+CANONICAL_TASK_TYPES = frozenset({
+    "code-fix", "code-feature", "code-review", "docs", "research", "probe",
+    "test-hardening", "bakeoff", "image-gen", "copywriting", "data-pipeline",
+    "site-build", "persona-review", "motion-design", "commitment-verification",
+    "backlog-triage", "triage", "planning", "one-request",
+})
+TASK_TYPE_ALIASES = {
+    "code_fix": "code-fix", "bugfix": "code-fix", "code-bugfix": "code-fix",
+    "code-edit": "code-fix", "code-change": "code-fix",
+    "code_feature": "code-feature", "code-build": "code-feature", "code": "code-feature",
+    "code_review": "code-review", "review": "code-review",
+    "adversarial-review": "code-review", "code-verification": "code-review",
+    "cross-cutting-review": "code-review",
+}
+
+
+def is_codex_engine(engine_name: str, engine: EngineConfig | None) -> bool:
+    """True for the engine named codex or any engine whose binary is codex."""
+    if engine_name == DEFAULT_ENGINE_NAME:
+        return True
+    return engine is not None and Path(engine.bin).name == DEFAULT_ENGINE_NAME
+
+
+def codex_model_policy_error(task: TaskSpec, config: AppConfig | None) -> str:
+    """Return why a codex task may not run, or "" when its model is allowed."""
+    engine = config.engines.get(task.engine) if config else None
+    if not is_codex_engine(task.engine, engine):
+        return ""
+    model = task.model or (engine.model_default if engine else "")
+    allowed = ", ".join(CODEX_ALLOWED_MODELS)
+    if not model:
+        return (
+            f"{task.key}: codex tasks must name {allowed} (set the task's \"model\" "
+            f"field or engines.codex.model_default); no model is set."
+        )
+    if model not in CODEX_ALLOWED_MODELS:
+        return (
+            f"{task.key}: codex model {model!r} is not allowed; the only allowed "
+            f"codex model is {allowed}."
+        )
+    return ""
+
+
 def lint_manifest(
     manifest: Manifest,
     *,
@@ -2151,6 +2197,9 @@ def lint_manifest(
             findings.append(
                 f"{task.key}: check may fail without printing why; retry prompt and eval log depend on failure output."
             )
+        policy_error = codex_model_policy_error(task, config)
+        if policy_error:
+            findings.append(f"ERROR: {policy_error}")
         if config is not None and task.engine in config.engines:
             dropped = dropped_engine_args(config.engines[task.engine], task.engine_args)
             if dropped:
@@ -2160,6 +2209,16 @@ def lint_manifest(
                     f"args_template. Add {{engine_args}} to engines.{task.engine}.args_template "
                     "in config.toml, or remove the field."
                 )
+        if task.task_type in TASK_TYPE_ALIASES:
+            findings.append(
+                f"WARN: {task.key}: task_type {task.task_type!r} is an alias; use "
+                f"{TASK_TYPE_ALIASES[task.task_type]!r} so the model log buckets it with the rest."
+            )
+        elif task.task_type and task.task_type not in CANONICAL_TASK_TYPES:
+            findings.append(
+                f"WARN: {task.key}: task_type {task.task_type!r} is not in the known list "
+                f"({', '.join(sorted(CANONICAL_TASK_TYPES))}); it will be its own bucket in the model log."
+            )
         if task.task_type in ticketed_types and not task.ticket:
             findings.append(
                 f"{task.key}: {task.task_type} names no ticket, so its cost and outcome "
@@ -3543,17 +3602,22 @@ def start_catalog_auto_refresh(
         return None
 
 
-# Promotion ladder: 3+ tasks and first-try >= 2/3 ("2 of 3"). The exact
-# fraction matters — 0.67 would misclassify a literal 2-of-3 record.
-PROVEN_MIN_TASKS = 3
-PROVEN_MIN_FIRST_TRY = 2 / 3
+# Promotion ladder: one rule, the evidence status (80% Wilson lower bound of
+# the first-try rate at or above the quality floor, n >= EVIDENCE_MIN_TASKS).
+def group_evidence_counts(group: dict[str, Any]) -> tuple[int, float]:
+    """In-window task count and first-try rate; groups without window fields
+    (hand-built dicts) fall back to their all-time numbers."""
+    if "evidence_tasks" in group:
+        return (
+            int(group.get("evidence_tasks") or 0),
+            float(group.get("evidence_first_try_pass_rate") or 0),
+        )
+    return int(group.get("tasks") or 0), float(group.get("first_try_pass_rate") or 0)
 
 
 def proven_model_group(group: dict[str, Any]) -> bool:
-    return (
-        int(group.get("tasks") or 0) >= PROVEN_MIN_TASKS
-        and float(group.get("first_try_pass_rate") or 0) >= PROVEN_MIN_FIRST_TRY
-    )
+    tasks, rate = group_evidence_counts(group)
+    return model_scoreboard_status(tasks, rate) == "SUPPORTED"
 
 
 def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
@@ -7816,6 +7880,8 @@ def aggregate_model_log_rows(
                 "median_tokens": None,
                 "last_seen": "",
                 "_first_try_passed": 0,
+                "_w_tasks": 0,
+                "_w_first_passed": 0,
                 "_duration_ms": [],
                 "_tokens": [],
             },
@@ -7878,6 +7944,8 @@ def aggregate_model_log_rows(
                 "median_tokens": None,
                 "last_seen": "",
                 "_first_try_passed": 0,
+                "_w_tasks": 0,
+                "_w_first_passed": 0,
                 "_duration_ms": [],
                 "_tokens": [],
             },
@@ -7890,6 +7958,10 @@ def aggregate_model_log_rows(
             group["failed"] += 1
         if model_log_text(first.get("verdict")).upper() == "PASS":
             group["_first_try_passed"] += 1
+        if evidence_in_window(final.get("logged_at")):
+            group["_w_tasks"] += 1
+            if model_log_text(first.get("verdict")).upper() == "PASS":
+                group["_w_first_passed"] += 1
         duration_ms = model_log_int(final.get("duration_ms"))
         if duration_ms is not None:
             group["_duration_ms"].append(duration_ms)
@@ -7926,6 +7998,10 @@ def aggregate_model_log_rows(
                 "failed": group["failed"],
                 "pass_rate": group["pass_rate"],
                 "first_try_pass_rate": group["first_try_pass_rate"],
+                "evidence_tasks": group["_w_tasks"],
+                "evidence_first_try_pass_rate": (
+                    group["_w_first_passed"] / group["_w_tasks"] if group["_w_tasks"] else 0.0
+                ),
                 "median_duration_ms": group["median_duration_ms"],
                 "median_tokens": group["median_tokens"],
                 "last_seen": group["last_seen"],
@@ -8162,6 +8238,27 @@ def load_model_identity_registry(path: Path | None = None) -> ModelIdentityRegis
     return ModelIdentityRegistry(identities, defaults, engine_meta, noncanonical_routes)
 
 
+ROUTE_VARIANT_SUFFIXES = (
+    "nitro", "floor", "online", "free", "batch", "thinking", "extended", "exacto",
+)
+
+
+def noncanonical_route_lookup(
+    registry: ModelIdentityRegistry, engine: str, model_key: str
+) -> NoncanonicalRoute | None:
+    """Guard lookup that ignores case and a trailing :variant (:nitro, :free, ...)."""
+    key = model_key.strip().lower()
+    candidates = [model_key, key]
+    head, sep, tail = key.rpartition(":")
+    if sep and tail in ROUTE_VARIANT_SUFFIXES:
+        candidates.append(head)
+    for candidate in candidates:
+        route = registry.noncanonical_routes.get((engine, candidate))
+        if route is not None:
+            return route
+    return None
+
+
 def noncanonical_route_findings(
     manifest: Manifest,
     *,
@@ -8175,7 +8272,7 @@ def noncanonical_route_findings(
         model_key = task.model or (engine.model_default if engine is not None else "")
         if not model_key:
             model_key = identity_registry.defaults.get(task.engine, "")
-        route = identity_registry.noncanonical_routes.get((task.engine, model_key))
+        route = noncanonical_route_lookup(identity_registry, task.engine, model_key)
         if route is None:
             continue
         findings.append(
@@ -8324,9 +8421,7 @@ def enrich_model_groups_with_identity(
         if item.get("unattributed") or item.get("misrouted") or item.get("invalidated_only"):
             item["tier"] = "unranked"
         elif "tier" not in item:
-            item["tier"] = model_scoreboard_tier(
-                int(item.get("tasks") or 0), float(item.get("first_try_pass_rate") or 0)
-            )
+            item["tier"] = model_scoreboard_tier(*group_evidence_counts(item))
         item["bucket_id"] = "|".join(
             (
                 str(item.get("engine") or ""),
@@ -8413,6 +8508,7 @@ def create_read_model_schema(conn: Any) -> None:
             verdict TEXT,
             duration_ms INTEGER,
             worker_tokens INTEGER,
+            cost_usd REAL,
             evidence_excluded INTEGER,
             invalidated_at TEXT,
             invalidation_reason TEXT,
@@ -8475,6 +8571,13 @@ def create_read_model_schema(conn: Any) -> None:
         conn.execute("ALTER TABLE attempts ADD COLUMN expected_model TEXT")
     if not read_model_column_exists(conn, "attempts", "evidence_excluded"):
         conn.execute("ALTER TABLE attempts ADD COLUMN evidence_excluded INTEGER")
+    if not read_model_column_exists(conn, "attempts", "cost_usd"):
+        conn.execute("ALTER TABLE attempts ADD COLUMN cost_usd REAL")
+        # Rows ingested before this column existed have no cost; dropping the
+        # stored fingerprint makes the next sync rebuild from the JSONL log.
+        conn.execute(
+            "DELETE FROM sync_state WHERE key IN ('log_prefix_sha256', 'log_mtime_ns')"
+        )
     if not read_model_column_exists(conn, "attempts", "invalidated_at"):
         conn.execute("ALTER TABLE attempts ADD COLUMN invalidated_at TEXT")
     if not read_model_column_exists(conn, "attempts", "invalidation_reason"):
@@ -8566,6 +8669,13 @@ def read_catalog_events_from_offset(path: Path, offset: int) -> tuple[list[dict[
     return events, final_offset
 
 
+def row_cost_usd(row: dict[str, Any]) -> float | None:
+    value = row.get("cost_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
     payloads: list[tuple[Any, ...]] = []
     for row in rows:
@@ -8584,6 +8694,7 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
                 model_log_text(row.get("verdict")),
                 model_log_int(row.get("duration_ms")),
                 model_log_int(row.get("worker_tokens")),
+                row_cost_usd(row),
                 1 if model_log_row_is_invalidated(row) else 0,
                 model_log_text(row.get("invalidated_at")) or None,
                 model_log_text(row.get("invalidation_reason")) or None,
@@ -8596,10 +8707,10 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
             INSERT INTO attempts (
                 run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                 reasoning_effort, task_type, retry,
-                verdict, duration_ms, worker_tokens, evidence_excluded, invalidated_at,
+                verdict, duration_ms, worker_tokens, cost_usd, evidence_excluded, invalidated_at,
                 invalidation_reason, orchestrator
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payloads,
         )
@@ -8967,7 +9078,7 @@ def db_attempt_rows(
         query = """
             SELECT run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                    reasoning_effort, task_type, retry,
-                   verdict, duration_ms, worker_tokens, evidence_excluded, invalidated_at,
+                   verdict, duration_ms, worker_tokens, cost_usd, evidence_excluded, invalidated_at,
                    invalidation_reason, orchestrator
             FROM attempts
         """
@@ -8991,6 +9102,7 @@ def db_attempt_rows(
                 "verdict": row["verdict"],
                 "duration_ms": row["duration_ms"],
                 "worker_tokens": row["worker_tokens"],
+                "cost_usd": row["cost_usd"],
                 "evidence_excluded": bool(row["evidence_excluded"]),
                 "invalidated_at": row["invalidated_at"],
                 "invalidation_reason": row["invalidation_reason"],
@@ -9322,10 +9434,90 @@ def catalog_identity_fields(
     return {"model_display": display, "lab": lab}
 
 
+# Evidence status per (model, effort) slot: 80% Wilson interval of the
+# first-try rate against a quality floor, one rule for every caller.
+WILSON_Z_80 = 1.2816
+PLAN_BILLED_ENGINES = frozenset({"codex", "grok"})
+EVIDENCE_MIN_TASKS = 8
+EVIDENCE_QUALITY_FLOOR = 0.45
+EVIDENCE_STALE_DAYS = 90
+
+
+def wilson_interval(successes: int, n: int, z: float = WILSON_Z_80) -> tuple[float, float]:
+    if n <= 0:
+        return (0.0, 1.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+def model_scoreboard_status(tasks: int, first_try_pass_rate: float) -> str:
+    if tasks < EVIDENCE_MIN_TASKS:
+        return "UNTESTED"
+    lower, upper = wilson_interval(round(first_try_pass_rate * tasks), tasks)
+    if lower >= EVIDENCE_QUALITY_FLOOR:
+        return "SUPPORTED"
+    if upper < EVIDENCE_QUALITY_FLOOR:
+        return "CONTRADICTED"
+    return "PROVISIONAL"
+
+
+def evidence_is_stale(last_seen: Any, now: Any = None) -> bool:
+    def parse(value: Any) -> datetime | None:
+        text = model_log_text(value)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    seen = parse(last_seen)
+    if seen is None:
+        return True  # a missing or unparseable date counts as stale
+    current = parse(now) or datetime.now(timezone.utc)
+    return (current - seen).days > EVIDENCE_STALE_DAYS
+
+
+EVIDENCE_WINDOW_START = "2026-09-01T00:00:00+00:00"
+EVIDENCE_STATUS_ORDER = {"CONTRADICTED": 0, "PROVISIONAL": 1, "SUPPORTED": 2}
+
+
+def parse_evidence_time(value: Any) -> datetime | None:
+    text = model_log_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def evidence_in_window(logged_at: Any) -> bool:
+    """One fixed window for now (EVIDENCE_WINDOW_START); a missing or
+    unparseable date is stale, never in-window."""
+    seen = parse_evidence_time(logged_at)
+    start = parse_evidence_time(EVIDENCE_WINDOW_START)
+    return seen is not None and start is not None and seen >= start
+
+
+def window_evidence(tasks: int, first_try_passed: int) -> tuple[str, float | None, float | None]:
+    """Status plus 80% Wilson bounds over in-window tasks only."""
+    status = model_scoreboard_status(tasks, first_try_passed / tasks if tasks else 0.0)
+    if tasks <= 0:
+        return status, None, None
+    lower, upper = wilson_interval(first_try_passed, tasks)
+    return status, lower, upper
+
+
 def model_scoreboard_tier(tasks: int, first_try_pass_rate: float) -> str:
-    # Same promotion rule as proven_model_group: volume alone never proves a
-    # model — a 0% pass rate with many tasks is evidence against, not for.
-    if tasks >= PROVEN_MIN_TASKS and first_try_pass_rate >= PROVEN_MIN_FIRST_TRY:
+    # Legacy names: only SUPPORTED is "proven". Volume alone never proves a
+    # model; the Wilson lower bound must clear the floor.
+    if model_scoreboard_status(tasks, first_try_pass_rate) == "SUPPORTED":
         return "proven"
     return "probation"
 
@@ -9373,9 +9565,14 @@ def aggregate_model_scoreboard_rows(
                 "failed": 0,
                 "retries": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
                 "_duration_ms": [],
                 "_tokens": [],
+                "_costs": [],
+                "_cost_attempts": 0,
+                "_cost_first_passed": 0,
                 "_task_types": {},
             },
         )
@@ -9389,6 +9586,8 @@ def aggregate_model_scoreboard_rows(
                 "passed": 0,
                 "failed": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
             },
         )
@@ -9440,9 +9639,14 @@ def aggregate_model_scoreboard_rows(
                 "failed": 0,
                 "retries": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
                 "_duration_ms": [],
                 "_tokens": [],
+                "_costs": [],
+                "_cost_attempts": 0,
+                "_cost_first_passed": 0,
                 "_task_types": {},
             },
         )
@@ -9456,12 +9660,17 @@ def aggregate_model_scoreboard_rows(
                 "passed": 0,
                 "failed": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
             },
         )
         passed = model_log_text(final.get("verdict")).upper() == "PASS"
         first_passed = model_log_text(first.get("verdict")).upper() == "PASS"
+        in_window = evidence_in_window(final.get("logged_at"))
         for target in (model_entry, breakdown):
+            target["w_tasks"] += 1 if in_window else 0
+            target["w_first_passed"] += 1 if in_window and first_passed else 0
             target["tasks"] += 1
             target["attempts"] += len(ordered)
             target["passed"] += 1 if passed else 0
@@ -9478,6 +9687,18 @@ def aggregate_model_scoreboard_rows(
             tokens = model_log_int(row.get("worker_tokens"))
             if tokens is not None:
                 model_entry["_tokens"].append(tokens)
+        # Each row's cost_usd is the task's RUNNING total across attempts
+        # (_refresh_cost), so the task's cost is its largest row, never the sum.
+        task_costs = [
+            float(row["cost_usd"])
+            for row in ordered
+            if isinstance(row.get("cost_usd"), (int, float))
+            and not isinstance(row.get("cost_usd"), bool)
+        ]
+        if task_costs:
+            model_entry["_costs"].append(max(task_costs))
+            model_entry["_cost_attempts"] += len(ordered)
+            model_entry["_cost_first_passed"] += 1 if first_passed else 0
 
     finalized: list[dict[str, Any]] = []
     for entry in models.values():
@@ -9485,6 +9706,9 @@ def aggregate_model_scoreboard_rows(
         breakdown_rows = []
         for breakdown in entry["_task_types"].values():
             b_tasks = int(breakdown["tasks"])
+            b_status, b_lower, b_upper = window_evidence(
+                breakdown["w_tasks"], breakdown["w_first_passed"]
+            )
             breakdown_rows.append(
                 {
                     "task_type": breakdown["task_type"],
@@ -9495,15 +9719,54 @@ def aggregate_model_scoreboard_rows(
                     "failed": breakdown["failed"],
                     "first_try_pass_rate": breakdown["first_try_passed"] / b_tasks if b_tasks else 0.0,
                     "pass_rate": breakdown["passed"] / b_tasks if b_tasks else 0.0,
+                    "evidence_tasks": breakdown["w_tasks"],
+                    "evidence_status": b_status,
+                    "evidence_lower": b_lower,
+                    "evidence_upper": b_upper,
                     "last_seen": breakdown["last_seen"],
                 }
             )
         breakdown_rows.sort(key=lambda item: (-item["tasks"], item["task_type"]))
         first_try_rate = entry["first_try_passed"] / tasks_count if tasks_count else 0.0
+        # Plan-billed engines log no real dollars and are never ranked on cost.
+        measured_cost = (
+            sum(entry["_costs"]) / len(entry["_costs"])
+            if entry["_costs"] and entry["engine"] not in PLAN_BILLED_ENGINES
+            else None
+        )
+        # c per attempt and p over the same costed tasks; the per-task cost
+        # already includes retries, so it is not divided by p again.
+        costed_tasks = len(entry["_costs"])
+        costed_p = entry["_cost_first_passed"] / costed_tasks if costed_tasks else 0.0
+        expected_cost = (
+            (sum(entry["_costs"]) / entry["_cost_attempts"]) / costed_p
+            if measured_cost is not None and entry["_cost_attempts"] and costed_p > 0
+            else None
+        )
+        # Status is judged per task type over the evidence window. The pooled
+        # row (no --task-type filter) reports the WORST status among the types
+        # with n >= EVIDENCE_MIN_TASKS (PROVISIONAL when none has), so a high-n
+        # model cannot clear the floor on one type and carry that to the rest.
+        pooled_status, pooled_lower, pooled_upper = window_evidence(
+            entry["w_tasks"], entry["w_first_passed"]
+        )
+        if task_type is None:
+            typed = [
+                row["evidence_status"]
+                for row in breakdown_rows
+                if row["evidence_status"] != "UNTESTED"
+            ]
+            if typed:
+                pooled_status = min(
+                    typed, key=lambda status: EVIDENCE_STATUS_ORDER.get(status, 0)
+                )
+            elif pooled_status != "UNTESTED":
+                pooled_status = "PROVISIONAL"
+            pooled_lower = pooled_upper = None
         tier = (
             "unranked"
             if entry["unattributed"] or (entry["invalidated_rows"] and not tasks_count)
-            else model_scoreboard_tier(tasks_count, first_try_rate)
+            else ("proven" if pooled_status == "SUPPORTED" else "probation")
         )
         finalized.append(
             {
@@ -9514,6 +9777,13 @@ def aggregate_model_scoreboard_rows(
                 "unattributed": entry["unattributed"],
                 "invalidated_only": bool(entry["invalidated_rows"] and not tasks_count),
                 "tier": tier,
+                "measured_cost_per_task": measured_cost,
+                "expected_cost_per_verified_pass": expected_cost,
+                "evidence_status": pooled_status,
+                "evidence_lower": pooled_lower,
+                "evidence_upper": pooled_upper,
+                "evidence_tasks": entry["w_tasks"],
+                "evidence_stale": evidence_is_stale(entry["last_seen"]),
                 "tasks": tasks_count,
                 "attempts": entry["attempts"],
                 "invalidated_rows": entry["invalidated_rows"],
@@ -9547,6 +9817,10 @@ def estimated_task_cost(row: dict[str, Any], catalog_model: dict[str, Any] | Non
 
 
 def model_sort_cost(row: dict[str, Any], catalog_model: dict[str, Any] | None) -> float:
+    # Measured dollars per verified pass beat the catalog estimator.
+    measured = row.get("expected_cost_per_verified_pass")
+    if isinstance(measured, (int, float)):
+        return float(measured)
     cost = estimated_task_cost(row, catalog_model)
     if cost is not None:
         return cost
@@ -9642,6 +9916,9 @@ def source_file_link(path: Path, label: str) -> str:
 
 
 def model_task_cost_label(row: dict[str, Any], catalog_model: dict[str, Any] | None) -> str:
+    measured = row.get("measured_cost_per_task")
+    if isinstance(measured, (int, float)):
+        return fmt_short_task_cost(float(measured))
     median_tokens = row.get("median_tokens")
     if median_tokens is None:
         return "in plan"
@@ -11798,6 +12075,15 @@ class RingerRunner:
             engine,
             runtime.last_worker_command,
         )
+        # A fast, tokenless, plain FAIL on a token-reporting engine is infra
+        # noise: keep the row for the record but exclude it from evidence.
+        # Only FAIL qualifies; ENGINE_DOWN, TIMEOUT and the rest stay as logged.
+        zero_token_excluded = verdict == "FAIL" and worker_zero_token_early_exit(
+            worker,
+            runtime.task.engine,
+            engine,
+            duration_s=duration_ms / 1000.0,
+        )
         reported_model = model_log_text(worker.reported_model) or None
         mismatch = bool(reported_model and resolved_model and reported_model != resolved_model)
         stamped_model = reported_model or resolved_model
@@ -11875,6 +12161,17 @@ class RingerRunner:
                 "cost_usd": runtime.cost_usd,
                 "model_steps": runtime.model_steps,
                 "retry": retrying,
+                **(
+                    {
+                        "evidence_excluded": True,
+                        "invalidation_reason": (
+                            "zero-token early exit on a token-reporting engine "
+                            "(infrastructure, not model evidence)"
+                        ),
+                    }
+                    if zero_token_excluded
+                    else {}
+                ),
             }
         )
 
@@ -12069,6 +12366,31 @@ def worker_never_ran(worker: WorkerResult) -> bool:
     if worker.error is not None and worker.returncode is None and not worker.timed_out:
         return True
     return worker.returncode in (126, 127)
+
+
+def worker_zero_token_early_exit(
+    worker: WorkerResult,
+    engine_name: str,
+    engine: EngineConfig | None,
+    *,
+    duration_s: float,
+) -> bool:
+    """True for a fast, tokenless, non-timeout failure on a token-reporting engine.
+
+    Narrow on purpose: grok emits no tokens, so it is exempt; an engine with no
+    token parser tells us nothing; a timeout or a long run is model evidence.
+    Used only to keep the attempt out of the model log (not to change the
+    verdict or trip the spawn-failure circuit breaker).
+    """
+    if engine is None or "grok" in engine_name.lower():
+        return False
+    if not (engine.token_regex or engine.token_format):
+        return False
+    if worker.tokens or worker.timed_out or worker.error is not None:
+        return False
+    if worker.returncode in (None, 0):
+        return False
+    return duration_s <= ENGINE_DOWN_WEAK_MAX_S
 
 
 def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
@@ -12535,8 +12857,20 @@ def effective_model_from_command(command: list[str]) -> str:
     return ""
 
 
+
+
 def effective_reasoning_effort_from_command(command: list[str]) -> str | None:
     """Return an explicitly configured model reasoning effort from worker argv."""
+    for index, item in enumerate(command):
+        # Record any non-empty value (low/high/max are only the known ones).
+        if item == "--variant" and index + 1 < len(command):
+            value = command[index + 1].strip()
+            if value and not value.startswith("-"):
+                return value
+        elif item.startswith("--variant="):
+            value = item.removeprefix("--variant=").strip()
+            if value:
+                return value
     for item in command:
         match = re.search(
             r"(?:^|[=,\s])model_reasoning_effort\s*=\s*[\"']?([^\"',\s]+)",
@@ -12685,6 +13019,50 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             )
 
 
+def codex_command_policy_error(task: TaskSpec, engine: EngineConfig) -> str:
+    """Check the argv that will actually run, not just the declared model."""
+    if not is_codex_engine(engine.name, engine):
+        return ""
+    allowed = ", ".join(CODEX_ALLOWED_MODELS)
+
+    def model_override(item: str) -> bool:
+        return item in {"-m", "--model"} or item.startswith("--model=") or bool(
+            re.match(r"\s*model\s*=", item)
+        )
+
+    if any(model_override(item) for item in task.engine_args):
+        return (
+            f"{task.key}: codex engine_args may not set the model (-m/--model/-c model=); "
+            f"the only allowed codex model is {allowed}, set via the task's \"model\" field."
+        )
+    command = build_worker_command(
+        engine,
+        taskdir=Path("."),
+        spec="",
+        full_access=task.full_access,
+        engine_args=task.engine_args,
+        model=task.model,
+    )
+    models = [
+        command[i + 1] if i + 1 < len(command) else ""
+        for i, item in enumerate(command)
+        if item in {"-m", "--model"}
+    ] + [item.removeprefix("--model=") for item in command if item.startswith("--model=")]
+    if not models:
+        return (
+            f"{task.key}: codex command passes no -m model, so ~/.codex/config.toml would "
+            f"pick the model; add {{model_args}} to engines.{engine.name}.args_template "
+            f"(allowed model: {allowed})."
+        )
+    bad = [m for m in models if m not in CODEX_ALLOWED_MODELS]
+    if bad:
+        return (
+            f"{task.key}: codex command would run model {bad[0]!r}; the only allowed "
+            f"codex model is {allowed}."
+        )
+    return ""
+
+
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
     missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
     if missing:
@@ -12694,6 +13072,11 @@ def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
         swallow = claude_list_flag_swallow_message(task)
         if swallow and args_template_puts_spec_after_engine_args(engine.args_template):
             raise ValueError(swallow)
+        policy_error = codex_model_policy_error(task, config) or codex_command_policy_error(
+            task, engine
+        )
+        if policy_error:
+            raise ValueError(policy_error)
         requires_model = any("{model}" in item for item in engine.args_template)
         accepts_model = requires_model or "{model_args}" in engine.args_template
         if requires_model and not (task.model or engine.model_default):
@@ -13362,9 +13745,14 @@ def one_request_manifest(
 ) -> Manifest:
     engine_args: list[str] = []
     if engine == DEFAULT_ENGINE_NAME:
+        if model and model not in CODEX_ALLOWED_MODELS:
+            raise ValueError(
+                f"--model {model!r} is not allowed on the codex engine; the only "
+                f"allowed codex model is {', '.join(CODEX_ALLOWED_MODELS)}."
+            )
         engine_args.extend(("-c", f"model_reasoning_effort={reasoning_effort}"))
-    elif model:
-        raise ValueError("--model is currently supported only by the codex engine")
+    elif model and engine != "opencode":
+        raise ValueError("--model is supported only by the codex and opencode engines")
     return Manifest(
         run_name="one-request",
         workdir=workdir,
@@ -13494,6 +13882,14 @@ def run_one_request(config: AppConfig, args: argparse.Namespace) -> int:
         model=args.model,
         redact=args.redact,
     )
+    lint_findings = lint_manifest(
+        manifest,
+        config=config,
+        allow_noncanonical_route=bool(getattr(args, "allow_noncanonical_route", False)),
+    )
+    print_lint_findings(lint_findings)
+    if any(finding.startswith("ERROR:") for finding in lint_findings):
+        return 1
     validate_manifest_engines(manifest, config)
     preflight_engine_bins(manifest, config)
     identity = resolve_identity(
@@ -14112,7 +14508,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ENGINE_NAME,
         help=f"worker engine (default: {DEFAULT_ENGINE_NAME})",
     )
-    ask_parser.add_argument("--model", help="Codex model override")
+    ask_parser.add_argument("--model", help="Model override (codex, or an opencode model slug)")
     ask_parser.add_argument(
         "--reasoning-effort",
         choices=("minimal", "low", "medium", "high"),
@@ -14320,13 +14716,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "lint":
             manifest = Manifest.from_path(args.manifest)
             print_engine_bin_diagnostics_if_config_loads(args.config)
+            try:
+                lint_config: AppConfig | None = AppConfig.load(args.config)
+            except Exception:
+                lint_config = None
             findings = lint_manifest(
                 manifest,
+                config=lint_config,
                 allow_noncanonical_route=args.allow_noncanonical_route,
             )
             if findings:
                 print_lint_findings(findings)
-                return 1
+                # Only WARN:-prefixed advisories (task-type nudges) print without failing.
+                return 0 if all(f.startswith("WARN:") for f in findings) else 1
             print(f"lint: clean ({len(manifest.tasks)} tasks)")
             return 0
 

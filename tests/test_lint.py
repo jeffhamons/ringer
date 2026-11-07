@@ -11,7 +11,41 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from ringer import Manifest, TaskSpec, Verifier, lint_manifest  # noqa: E402
+from dataclasses import replace  # noqa: E402
+
+import ringer  # noqa: E402
+from ringer import (  # noqa: E402
+    AppConfig,
+    ArtifactConfig,
+    EvalConfig,
+    Manifest,
+    TaskSpec,
+    Verifier,
+    lint_manifest,
+)
+
+
+def sol_config() -> AppConfig:
+    """Codex policy: tasks that name no model need engines.codex.model_default = gpt-6.1-sol."""
+    engine = replace(ringer.built_in_codex_engine(), model_default="gpt-6.1-sol")
+    root = Path(tempfile.gettempdir())
+    return AppConfig(
+        path=None,
+        identity_default=None,
+        state_dir=root / "ringer-lint-state",
+        dashboard_port_base=8787,
+        hud_port=8700,
+        hud_app_path=None,
+        allow_full_access=False,
+        eval=EvalConfig(backend="jsonl", jsonl_path=root / "ringer-lint-runs.jsonl"),
+        engines={"codex": engine},
+        artifact=ArtifactConfig(
+            enabled=False,
+            out_template=str(root / "live.html"),
+            report_template=str(root / "report.html"),
+            index_out=root / "index.html",
+        ),
+    )
 
 
 LONG_SPEC = (
@@ -64,6 +98,31 @@ class LintManifestTests(unittest.TestCase):
 
     def assertHasFinding(self, findings: list[str], expected: str) -> None:
         self.assertIn(expected, findings, f"expected lint finding not found: {expected}\nfindings: {findings}")
+
+    def lint_type(self, task_type: str) -> list[str]:
+        task = self.task()
+        task["task_type"] = task_type
+        return lint_manifest(self.manifest([task]))
+
+    def test_alias_task_type_warns_with_canonical_name(self) -> None:
+        for alias, canonical in [("code_fix", "code-fix"), ("bugfix", "code-fix"), ("code-build", "code-feature"), ("review", "code-review")]:
+            findings = self.lint_type(alias)
+            self.assertTrue(
+                any(f"task_type {alias!r}" in f and canonical in f and not f.startswith("ERROR") for f in findings),
+                (alias, findings),
+            )
+
+    def test_unknown_task_type_warns_but_canonical_and_empty_do_not(self) -> None:
+        self.assertTrue(any("task_type 'mystery-work'" in f for f in self.lint_type("mystery-work")))
+        for ok in ("code-fix", "docs", "bakeoff", "one-request", ""):
+            self.assertFalse(any("task_type" in f for f in self.lint_type(ok)), ok)
+
+    def test_task_type_is_never_rewritten(self) -> None:
+        task = self.task()
+        task["task_type"] = "bugfix"
+        manifest = self.manifest([task])
+        lint_manifest(manifest)
+        self.assertEqual("bugfix", manifest.tasks[0].task_type)
 
     def test_task_fields_must_be_strings(self) -> None:
         with self.assertRaisesRegex(ValueError, r"task one: check must be a string"):
@@ -245,7 +304,7 @@ class LintManifestTests(unittest.TestCase):
             worktrees=False,
             max_parallel=3,
         )
-        self.assertEqual([], lint_manifest(manifest))
+        self.assertEqual([], lint_manifest(manifest, config=sol_config()))
 
     def test_verifier_expands_user_expect_files(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -333,7 +392,7 @@ class LintManifestTests(unittest.TestCase):
             ],
             max_parallel=2,
         )
-        self.assertEqual([], lint_manifest(manifest), "compliant manifest should have no lint findings")
+        self.assertEqual([], lint_manifest(manifest, config=sol_config()), "compliant manifest should have no lint findings")
 
     def test_templates_are_clean(self) -> None:
         # Every kit ships one or more manifest skeletons (manifest.json plus
@@ -343,7 +402,7 @@ class LintManifestTests(unittest.TestCase):
         for path in template_paths:
             with self.subTest(template=path.name):
                 manifest = Manifest.from_path(path)
-                findings = lint_manifest(manifest)
+                findings = lint_manifest(manifest, config=sol_config())
                 self.assertEqual([], findings, f"{path} should lint clean, got: {findings}")
 
 

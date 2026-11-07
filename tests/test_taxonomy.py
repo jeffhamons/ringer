@@ -27,6 +27,11 @@ from ringer import (  # noqa: E402
     WorkerResult,
     aggregate_model_log_rows,
     aggregate_model_scoreboard_rows,
+    model_scoreboard_tier,
+    model_scoreboard_status,
+    wilson_interval,
+    evidence_is_stale,
+    order_model_scoreboard_rows,
     build_models_api_payload,
     create_read_model_schema,
     enrich_model_groups_with_identity,
@@ -54,7 +59,7 @@ def row(
         "verdict": "PASS",
         "duration_ms": 10,
         "worker_tokens": 20,
-        "logged_at": f"2026-07-0{min(len(run_id), 9)}T10:00:00+00:00",
+        "logged_at": f"2026-10-0{min(len(run_id), 9)}T10:00:00+00:00",
     }
 
 
@@ -298,6 +303,154 @@ source = "fixture"
             ).fetchone())
             self.assertEqual(3, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(3, conn.execute("SELECT version FROM schema_version").fetchone()[0])
+
+
+class WilsonTierTests(unittest.TestCase):
+    def test_status_thresholds(self) -> None:
+        cases = [
+            (3, 2 / 3, "UNTESTED"),
+            (7, 1.0, "UNTESTED"),
+            (8, 6 / 8, "SUPPORTED"),
+            (10, 7 / 10, "SUPPORTED"),
+            (8, 5 / 8, "PROVISIONAL"),
+            (10, 6 / 10, "PROVISIONAL"),
+            (10, 0.0, "CONTRADICTED"),
+            (20, 3 / 20, "CONTRADICTED"),
+        ]
+        for tasks, rate, want in cases:
+            self.assertEqual(want, model_scoreboard_status(tasks, rate), (tasks, rate))
+
+    def test_legacy_tier_names_map_from_status(self) -> None:
+        self.assertEqual("proven", model_scoreboard_tier(8, 6 / 8))
+        self.assertEqual("probation", model_scoreboard_tier(3, 2 / 3))
+        self.assertEqual("probation", model_scoreboard_tier(8, 5 / 8))
+        self.assertEqual("probation", model_scoreboard_tier(10, 0.0))
+
+    def test_wilson_interval_is_80_percent(self) -> None:
+        lo, hi = wilson_interval(6, 8)
+        self.assertAlmostEqual(0.5, lo, delta=0.06)
+        self.assertAlmostEqual(0.89, hi, delta=0.02)
+        self.assertEqual((0.0, 1.0), wilson_interval(0, 0))
+
+    def test_stale_flag_after_90_days(self) -> None:
+        now = "2026-11-07T00:00:00+00:00"
+        self.assertTrue(evidence_is_stale("2026-01-01T00:00:00+00:00", now=now))
+        self.assertFalse(evidence_is_stale("2026-10-20T00:00:00+00:00", now=now))
+        # A missing or unparseable date counts as stale, never fresh.
+        self.assertTrue(evidence_is_stale("", now=now))
+        self.assertTrue(evidence_is_stale("not-a-date", now=now))
+
+
+class EvidenceWindowAndPerTypeTests(unittest.TestCase):
+    def typed_rows(self, model: str, task_type: str, verdicts: list[str], *, logged_at: str | None = "2026-10-10T10:00:00+00:00") -> list[dict[str, object]]:
+        out = []
+        for i, verdict in enumerate(verdicts):
+            item = row(f"{model}-{task_type}-{i}", model=model, engine="opencode", task_type=task_type)
+            item["task_key"] = f"{task_type}-{i}"
+            item["verdict"] = verdict
+            if logged_at is None:
+                item.pop("logged_at")
+            else:
+                item["logged_at"] = logged_at
+            out.append(item)
+        return out
+
+    def test_old_passes_do_not_support_a_model_after_a_recent_fail(self) -> None:
+        old = self.typed_rows("openrouter/a/aging", "code-fix", ["PASS"] * 10, logged_at="2026-08-01T10:00:00+00:00")
+        recent = self.typed_rows("openrouter/a/aging", "code-fix", ["FAIL"], logged_at="2026-11-01T10:00:00+00:00")
+        recent[0]["task_key"] = "recent"
+        item = aggregate_model_scoreboard_rows(old + recent)[0]
+        self.assertEqual(11, item["tasks"])
+        self.assertEqual(1, item["evidence_tasks"])
+        self.assertEqual("UNTESTED", item["evidence_status"])
+        self.assertEqual("probation", item["tier"])
+
+    def test_undated_rows_are_outside_the_window(self) -> None:
+        undated = self.typed_rows("openrouter/a/undated", "code-fix", ["PASS"] * 10, logged_at=None)
+        item = aggregate_model_scoreboard_rows(undated)[0]
+        self.assertEqual(0, item["evidence_tasks"])
+        self.assertEqual("UNTESTED", item["evidence_status"])
+        self.assertTrue(item["evidence_stale"])
+
+    def test_pooled_row_does_not_carry_one_types_support_to_the_others(self) -> None:
+        model = "openrouter/a/mixed"
+        rows = self.typed_rows(model, "code-fix", ["PASS"] * 40) + self.typed_rows(model, "docs", ["FAIL"] * 12)
+        item = aggregate_model_scoreboard_rows(rows)[0]
+        by_type = {t["task_type"]: t for t in item["task_types"]}
+        self.assertEqual("SUPPORTED", by_type["code-fix"]["evidence_status"])
+        self.assertEqual("CONTRADICTED", by_type["docs"]["evidence_status"])
+        self.assertGreater(by_type["code-fix"]["evidence_lower"], 0.45)
+        self.assertLess(by_type["docs"]["evidence_upper"], 0.45)
+        self.assertEqual("CONTRADICTED", item["evidence_status"])
+        self.assertEqual("probation", item["tier"])
+
+    def test_pooled_row_is_supported_only_if_every_tested_type_is(self) -> None:
+        model = "openrouter/a/solid"
+        rows = self.typed_rows(model, "code-fix", ["PASS"] * 12) + self.typed_rows(model, "docs", ["PASS"] * 12)
+        self.assertEqual("SUPPORTED", aggregate_model_scoreboard_rows(rows)[0]["evidence_status"])
+        # A type below n=8 is ignored; pooled n alone (no type at n>=8) is only PROVISIONAL.
+        thin = self.typed_rows("openrouter/a/thin", "code-fix", ["PASS"] * 5) + self.typed_rows("openrouter/a/thin", "docs", ["PASS"] * 5)
+        item = aggregate_model_scoreboard_rows(thin)[0]
+        self.assertEqual("PROVISIONAL", item["evidence_status"])
+        self.assertEqual("probation", item["tier"])
+        filtered = aggregate_model_scoreboard_rows(rows, task_type="code-fix")[0]
+        self.assertEqual("SUPPORTED", filtered["evidence_status"])
+
+
+class MeasuredCostTests(unittest.TestCase):
+    def rows(self, engine: str, model: str, costs: list[float | None], passes: list[bool]) -> list[dict[str, object]]:
+        out = []
+        for i, (cost, ok) in enumerate(zip(costs, passes)):
+            item = row(f"{model}-{i}", model=model, engine=engine)
+            item["task_key"] = f"t{i}"
+            item["verdict"] = "PASS" if ok else "FAIL"
+            if cost is not None:
+                item["cost_usd"] = cost
+            out.append(item)
+        return out
+
+    def test_measured_cost_per_task_and_per_verified_pass(self) -> None:
+        rows = self.rows("opencode", "openrouter/a/cheap", [0.10, 0.20, 0.30, 0.40], [True, True, False, False])
+        item = aggregate_model_scoreboard_rows(rows)[0]
+        self.assertAlmostEqual(0.25, item["measured_cost_per_task"])
+        self.assertAlmostEqual(0.50, item["expected_cost_per_verified_pass"])
+
+    def test_cost_is_per_attempt_not_summed_running_totals(self) -> None:
+        # cost_usd on each row is the task's RUNNING total (_refresh_cost), so
+        # attempt 1 = 0.10 and attempt 2 = 0.30 means the task cost 0.30, not 0.40.
+        first = row("t-r", model="openrouter/a/retry", engine="opencode")
+        first.update(task_key="t0", verdict="FAIL", cost_usd=0.10, logged_at="2026-10-01T10:00:00+00:00")
+        second = row("t-r", model="openrouter/a/retry", engine="opencode")
+        second.update(task_key="t0", verdict="PASS", retry=True, cost_usd=0.30, logged_at="2026-10-01T10:05:00+00:00")
+        third = row("t-s", model="openrouter/a/retry", engine="opencode")
+        third.update(task_key="t1", verdict="PASS", cost_usd=0.10, logged_at="2026-10-01T11:00:00+00:00")
+        item = aggregate_model_scoreboard_rows([first, second, third])[0]
+        self.assertAlmostEqual(0.20, item["measured_cost_per_task"])  # (0.30 + 0.10) / 2
+        # c per attempt = 0.40 / 3 attempts; p = 1/2 first-try; no second division by p.
+        self.assertAlmostEqual((0.40 / 3) / 0.5, item["expected_cost_per_verified_pass"])
+
+    def test_no_measured_cost_or_plan_billed_engine_has_none(self) -> None:
+        plain = aggregate_model_scoreboard_rows(self.rows("opencode", "openrouter/a/none", [None, None], [True, True]))[0]
+        self.assertIsNone(plain["measured_cost_per_task"])
+        self.assertIsNone(plain["expected_cost_per_verified_pass"])
+        for engine in ("codex", "grok"):
+            plan = aggregate_model_scoreboard_rows(self.rows(engine, "plan-model", [0.5, 0.5], [True, True]))[0]
+            self.assertIsNone(plan["expected_cost_per_verified_pass"], engine)
+
+    def test_zero_first_try_passes_gives_no_expected_cost(self) -> None:
+        item = aggregate_model_scoreboard_rows(self.rows("opencode", "openrouter/a/bad", [0.1, 0.1], [False, False]))[0]
+        self.assertIsNone(item["expected_cost_per_verified_pass"])
+
+    def test_sort_prefers_measured_expected_cost_over_estimator(self) -> None:
+        base = {"tier": "probation", "first_try_pass_rate": 0.5, "pass_rate": 0.5, "engine": "opencode"}
+        cheap = dict(base, model="m-cheap", median_tokens=10**9, expected_cost_per_verified_pass=0.2)
+        dear = dict(base, model="m-dear", median_tokens=1, expected_cost_per_verified_pass=2.0)
+        catalog = {
+            "m-cheap": {"prompt_per_m": 1000, "completion_per_m": 1000},
+            "m-dear": {"prompt_per_m": 1, "completion_per_m": 1},
+        }
+        ordered = order_model_scoreboard_rows([dear, cheap], catalog)
+        self.assertEqual(["m-cheap", "m-dear"], [r["model"] for r in ordered])
 
 
 if __name__ == "__main__":

@@ -214,6 +214,49 @@ class ModelDbTests(unittest.TestCase):
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM catalog_models").fetchone()[0])
             self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM identity").fetchone()[0])
 
+    def test_cost_usd_round_trips_so_db_path_equals_jsonl_path(self) -> None:
+        rows = [
+            {**attempt(run_id="c1", logged_at="2026-10-01T10:00:00+00:00"), "cost_usd": 0.30},
+            {**attempt(run_id="c2", logged_at="2026-10-01T11:00:00+00:00"), "cost_usd": 0.10},
+            attempt(run_id="c3", logged_at="2026-10-01T12:00:00+00:00"),
+        ]
+        write_jsonl(self.log_path, rows)
+        rebuild_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+        )
+        db_rows, _registry = ringer.db_attempt_rows(self.db_path)
+        self.assertEqual([0.30, 0.10, None], [row["cost_usd"] for row in db_rows])
+        jsonl_scoreboard = ringer.aggregate_model_scoreboard_rows(rows)
+        db_scoreboard = ringer.aggregate_model_scoreboard_rows(db_rows)
+        self.assertIsNotNone(db_scoreboard[0]["measured_cost_per_task"])
+        for key in ("measured_cost_per_task", "expected_cost_per_verified_pass"):
+            self.assertEqual(jsonl_scoreboard[0][key], db_scoreboard[0][key], key)
+
+    def test_existing_db_without_cost_column_is_migrated_and_resynced(self) -> None:
+        write_jsonl(
+            self.log_path,
+            [{**attempt(run_id="m1", logged_at="2026-10-01T10:00:00+00:00"), "cost_usd": 0.5}],
+        )
+        sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("ALTER TABLE attempts DROP COLUMN cost_usd")
+        sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+        )
+        db_rows, _registry = ringer.db_attempt_rows(self.db_path)
+        self.assertEqual([0.5], [row["cost_usd"] for row in db_rows])
+
     def test_sync_consumes_only_new_bytes_and_rebuilds_after_truncation(self) -> None:
         write_jsonl(self.log_path, [attempt(run_id="run-1")])
         rebuild_read_model_db(

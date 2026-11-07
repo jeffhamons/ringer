@@ -103,7 +103,9 @@ class HudModelsTabTests(unittest.TestCase):
         rollup = payload["rollup"][0]
         self.assertEqual("openrouter/acme/small", rollup["model"])
         self.assertEqual("Small", rollup["model_display"])
-        self.assertEqual("proven", rollup["tier"])
+        # 2 of 3 is n < 8: no longer "proven" under the Wilson rule.
+        self.assertEqual("probation", rollup["tier"])
+        self.assertEqual("UNTESTED", rollup["evidence_status"])
         self.assertEqual(3, rollup["tasks"])
         self.assertEqual(4, rollup["attempts"])
         self.assertEqual(1.0, rollup["pass_rate"])

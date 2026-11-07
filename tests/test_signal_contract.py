@@ -218,6 +218,94 @@ source = "fixture"
         secret_row = secret_row[: secret_row.index("</tr>")]
         self.assertIn('class="notes-cell" title=""></td>', secret_row)
 
+    def test_shipped_registry_guards_codex_sol_on_opencode(self) -> None:
+        registry = load_model_identity_registry(ROOT / "registry" / "model-identity.toml")
+        for slug in ("gpt-6.1-sol", "gpt-6-astra"):
+            self.assertIn(("codex", slug), registry.identities)
+        manifest = Manifest.from_obj(
+            {
+                "run_name": "route-test",
+                "workdir": str(self.root / "work"),
+                "tasks": [
+                    {
+                        "key": "sol-task",
+                        "engine": "opencode",
+                        "model": "openrouter/openai/gpt-6.1-sol",
+                        "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                        "check": "test -s output.txt || { echo missing; exit 1; }",
+                        "expect_files": ["output.txt"],
+                        "verified": "output.txt exists",
+                    }
+                ],
+            }
+        )
+        findings = lint_manifest(manifest, identity_registry=registry)
+        self.assertTrue(any("ERROR: sol-task" in item and "gpt-6.1-sol" in item for item in findings), findings)
+
+    def test_shipped_registry_guards_every_plan_billed_openrouter_route(self) -> None:
+        registry = load_model_identity_registry(ROOT / "registry" / "model-identity.toml")
+        slugs = [
+            f"openrouter/openai/{family}{suffix}"
+            for family in (
+                "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
+                "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol",
+            )
+            for suffix in ("", "-pro", ":batch", "-pro:batch")
+        ] + ["openrouter/x-ai/grok-4.7", "openrouter/x-ai/grok-4.7:batch", "openrouter/x-ai/grok-4.5"]
+        for slug in slugs:
+            manifest = Manifest.from_obj(
+                {
+                    "run_name": "route-test",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "t",
+                            "engine": "opencode",
+                            "model": slug,
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "test -s output.txt || { echo missing; exit 1; }",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            )
+            findings = lint_manifest(manifest, identity_registry=registry)
+            self.assertTrue(any(f.startswith("ERROR: t") and "noncanonical route" in f for f in findings), (slug, findings))
+
+    def test_route_guard_matches_variant_suffixed_and_cased_slugs(self) -> None:
+        registry = load_model_identity_registry(ROOT / "registry" / "model-identity.toml")
+        slugs = [
+            "openrouter/openai/gpt-6.1-sol:nitro",
+            "openrouter/openai/gpt-6.1-sol:floor",
+            "openrouter/openai/gpt-6.1-sol:online",
+            "openrouter/openai/gpt-5.5:free",
+            "openrouter/x-ai/grok-4.7:nitro",
+            "openrouter/x-ai/grok-4.5:batch",
+            "openrouter/openai/gpt-6.1-sol-pro:thinking",
+            "OpenRouter/OpenAI/GPT-6.1-Sol:Nitro",
+        ]
+        for slug in slugs:
+            manifest = Manifest.from_obj(
+                {
+                    "run_name": "route-test",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "t",
+                            "engine": "opencode",
+                            "model": slug,
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "test -s output.txt || { echo missing; exit 1; }",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            )
+            findings = lint_manifest(manifest, identity_registry=registry)
+            self.assertTrue(any(f.startswith("ERROR: t") and "noncanonical route" in f for f in findings), (slug, findings))
+
     def test_noncanonical_lint_escape_and_misrouted_credit(self) -> None:
         manifest = Manifest.from_obj(
             {
@@ -278,6 +366,73 @@ source = "fixture"
         self.assertIn(">misrouted</span>", html)
         chart = html[html.index("<main>") : html.index("</main>")]
         self.assertNotIn("openrouter/x-ai/grok-4.5", chart)
+
+    def test_lint_command_exits_zero_on_warnings_only(self) -> None:
+        manifest_path = self.root / "warn.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_name": "warn-cli",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "alias-task",
+                            "engine": "opencode",
+                            "model": "openrouter/z-ai/glm-5.3",
+                            "task_type": "bugfix",
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "test -s output.txt || { echo missing; exit 1; }",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_registry = ROOT / "registry" / "model-identity.toml"
+        with mock.patch.object(ringer, "default_model_registry_path", return_value=real_registry), mock.patch.object(
+            ringer, "maybe_self_update"
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = ringer.main(["lint", str(manifest_path)])
+        self.assertIn("lint: WARN: alias-task: task_type 'bugfix'", output.getvalue())
+        self.assertNotIn("ERROR", output.getvalue())
+        self.assertEqual(0, rc, output.getvalue())
+
+    def test_lint_command_still_exits_one_for_non_warn_finding(self) -> None:
+        manifest_path = self.root / "cannot-fail.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_name": "cannot-fail-cli",
+                    "workdir": str(self.root / "work"),
+                    "tasks": [
+                        {
+                            "key": "t",
+                            "engine": "opencode",
+                            "model": "openrouter/z-ai/glm-5.3",
+                            "task_type": "code-feature",
+                            "spec": "Create the requested output with enough detail to satisfy the route fixture contract.",
+                            "check": "true",
+                            "expect_files": ["output.txt"],
+                            "verified": "output.txt exists",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_registry = ROOT / "registry" / "model-identity.toml"
+        with mock.patch.object(ringer, "default_model_registry_path", return_value=real_registry), mock.patch.object(
+            ringer, "maybe_self_update"
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = ringer.main(["lint", str(manifest_path)])
+        self.assertIn("check cannot fail", output.getvalue())
+        self.assertEqual(1, rc, output.getvalue())
 
     def test_lint_command_reports_error_and_escape_flag_passes(self) -> None:
         manifest_path = self.root / "ringer.json"

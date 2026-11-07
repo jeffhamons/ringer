@@ -17,6 +17,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import ringer  # noqa: E402
+
 from ringer import (  # noqa: E402
     AppConfig,
     ArtifactConfig,
@@ -189,6 +191,55 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("      var       var ", rows[2])
         self.assertNotIn("FREE", rows[2])
 
+    def test_proven_model_group_uses_the_wilson_rule(self) -> None:
+        # The old 2-of-3 at n>=3 rule must not prove anything.
+        self.assertFalse(ringer.proven_model_group({"tasks": 3, "first_try_pass_rate": 1.0}))
+        self.assertFalse(ringer.proven_model_group({"tasks": 7, "first_try_pass_rate": 1.0}))
+        self.assertFalse(ringer.proven_model_group({"tasks": 8, "first_try_pass_rate": 5 / 8}))
+        self.assertTrue(ringer.proven_model_group({"tasks": 8, "first_try_pass_rate": 6 / 8}))
+
+    def test_stale_and_undated_passes_do_not_prove_a_model(self) -> None:
+        def rows_for(model_name: str, stamp: str | None) -> list[dict]:
+            out = []
+            for i in range(10):
+                row = {
+                    "run_id": f"{model_name}-{i}",
+                    "task_key": "task",
+                    "worker_engine": "opencode",
+                    "model": model_name,
+                    "task_type": "code-feature",
+                    "verdict": "PASS",
+                }
+                if stamp:
+                    row["logged_at"] = stamp
+                out.append(row)
+            return out
+
+        rows = (
+            rows_for("july-model", "2026-07-01T10:00:00+00:00")
+            + rows_for("undated-model", None)
+            + rows_for("fresh-model", "2026-10-01T10:00:00+00:00")
+        )
+        groups = {g["model"]: g for g in ringer.aggregate_model_log_rows(rows)}
+        self.assertEqual(10, groups["july-model"]["tasks"])
+        self.assertEqual(0, groups["july-model"]["evidence_tasks"])
+        self.assertEqual(0, groups["undated-model"]["evidence_tasks"])
+        self.assertFalse(ringer.proven_model_group(groups["july-model"]))
+        self.assertFalse(ringer.proven_model_group(groups["undated-model"]))
+        self.assertTrue(ringer.proven_model_group(groups["fresh-model"]))
+        enriched = {
+            g["model"]: g
+            for g in ringer.enrich_model_groups_with_identity(
+                list(groups.values()),
+                rows,
+                ringer.EMPTY_MODEL_IDENTITY_REGISTRY,
+                include_task_type=True,
+            )
+        }
+        self.assertEqual("probation", enriched["july-model"]["tier"])
+        self.assertEqual("probation", enriched["undated-model"]["tier"])
+        self.assertEqual("proven", enriched["fresh-model"]["tier"])
+
     def test_models_explore_tiers_and_candidates(self) -> None:
         log_path = self.root / "eval.jsonl"
         rows = [
@@ -199,9 +250,9 @@ class CatalogTests(unittest.TestCase):
                 "model": "tiered-alpha",
                 "task_type": "code-feature",
                 "verdict": "PASS",
-                "logged_at": f"2026-07-0{i}T10:00:00+00:00",
+                "logged_at": f"2026-10-0{i}T10:00:00+00:00",
             }
-            for i in range(1, 4)
+            for i in range(1, 9)
         ]
         rows.append(
             {
@@ -211,7 +262,7 @@ class CatalogTests(unittest.TestCase):
                 "model": "tiered-beta",
                 "task_type": "code-feature",
                 "verdict": "FAIL",
-                "logged_at": "2026-07-04T10:00:00+00:00",
+                "logged_at": "2026-10-04T10:00:00+00:00",
             }
         )
         log_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")

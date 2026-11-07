@@ -116,7 +116,7 @@ class ScoreboardPageTests(unittest.TestCase):
                         task_type="code-feature",
                         verdict="PASS",
                         retry=False,
-                        logged_at=f"2026-07-06T10:{index:02d}:00+00:00",
+                        logged_at=f"2026-10-06T10:{index:02d}:00+00:00",
                         tokens=2000,
                     )
                 )
@@ -129,7 +129,7 @@ class ScoreboardPageTests(unittest.TestCase):
                         task_type="code-feature",
                         verdict="FAIL",
                         retry=False,
-                        logged_at=f"2026-07-06T10:{index:02d}:00+00:00",
+                        logged_at=f"2026-10-06T10:{index:02d}:00+00:00",
                         tokens=2000,
                     )
                 )
@@ -141,7 +141,7 @@ class ScoreboardPageTests(unittest.TestCase):
                         task_type="code-feature",
                         verdict="PASS",
                         retry=True,
-                        logged_at=f"2026-07-06T11:{index:02d}:00+00:00",
+                        logged_at=f"2026-10-06T11:{index:02d}:00+00:00",
                         tokens=2200,
                     )
                 )
@@ -153,7 +153,7 @@ class ScoreboardPageTests(unittest.TestCase):
                 task_type="code-feature",
                 verdict="PASS",
                 retry=False,
-                logged_at="2026-07-06T12:00:00+00:00",
+                logged_at="2026-10-06T12:00:00+00:00",
                 tokens=500,
             )
         )
@@ -165,7 +165,7 @@ class ScoreboardPageTests(unittest.TestCase):
                 task_type="research",
                 verdict="PASS",
                 retry=False,
-                logged_at="2026-07-06T12:10:00+00:00",
+                logged_at="2026-10-06T12:10:00+00:00",
                 tokens=700,
             )
         )
@@ -177,7 +177,7 @@ class ScoreboardPageTests(unittest.TestCase):
                 task_type="site-build",
                 verdict="PASS",
                 retry=False,
-                logged_at="2026-07-06T12:20:00+00:00",
+                logged_at="2026-10-06T12:20:00+00:00",
                 tokens=None,
                 engine="codex",
             )
@@ -348,7 +348,7 @@ class ScoreboardPageTests(unittest.TestCase):
                     task_type="code-feature",
                     verdict="PASS" if index < 18 else "FAIL",
                     retry=False,
-                    logged_at=f"2026-07-06T13:{index:02d}:00+00:00",
+                    logged_at=f"2026-10-06T13:{index:02d}:00+00:00",
                     tokens=2000,
                 )
             )
@@ -360,7 +360,7 @@ class ScoreboardPageTests(unittest.TestCase):
                 task_type="code-feature",
                 verdict="PASS",
                 retry=False,
-                logged_at="2026-07-06T14:00:00+00:00",
+                logged_at="2026-10-06T14:00:00+00:00",
                 tokens=500,
             )
         )

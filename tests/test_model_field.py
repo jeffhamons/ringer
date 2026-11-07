@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from dataclasses import replace
 import unittest
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from ringer import (  # noqa: E402
     WorkerResult,
     build_worker_command,
     effective_model_from_command,
+    effective_reasoning_effort_from_command,
     load_engines,
     preflight_engine_bins,
     validate_manifest_engines,
@@ -209,8 +211,9 @@ class ModelValidationTests(unittest.TestCase):
         return task
 
     def test_model_on_non_harness_engine_is_rejected(self) -> None:
-        config = self.config({"codex": codex_like_engine()})
-        manifest = self.manifest(self.base_task(engine="codex", model="openrouter/x"))
+        # Neither named codex nor running the codex binary: the codex policy does not apply.
+        config = self.config({"plain": replace(codex_like_engine(), name="plain", bin="agent")})
+        manifest = self.manifest(self.base_task(engine="plain", model="openrouter/x"))
         with self.assertRaisesRegex(ValueError, "silently ignored"):
             validate_manifest_engines(manifest, config)
 
@@ -232,15 +235,15 @@ class ModelValidationTests(unittest.TestCase):
 
     def test_model_args_without_a_resolved_model_is_valid(self) -> None:
         engine = EngineConfig(
-            name="codex",
-            bin="codex",
+            name="plain",
+            bin="agent",
             args_template=("exec", "{model_args}", "{spec}"),
             full_access_args=(),
             sandbox_args=(),
             token_regex=None,
         )
-        config = self.config({"codex": engine})
-        manifest = self.manifest(self.base_task(engine="codex"))
+        config = self.config({"plain": engine})
+        manifest = self.manifest(self.base_task(engine="plain"))
         validate_manifest_engines(manifest, config)
 
     def test_eval_row_falls_back_to_model_in_last_worker_command(self) -> None:
@@ -303,6 +306,25 @@ class ModelValidationTests(unittest.TestCase):
         config = self.config({"worker": absolute, "shellworker": bare})
         preflight_engine_bins(self.manifest(self.base_task(engine="worker")), config)
         preflight_engine_bins(self.manifest(self.base_task(engine="shellworker")), config)
+
+
+class OpencodeVariantEffortTests(unittest.TestCase):
+    def test_variant_flag_is_recorded_as_effort(self) -> None:
+        for argv, want in [
+            (["opencode", "run", "--variant", "max", "x"], "max"),
+            (["opencode", "run", "--variant=low", "x"], "low"),
+            (["opencode", "run", "--variant", "high"], "high"),
+            # Any non-empty value is recorded, so an unknown variant still
+            # identifies its own slot instead of pooling with the default.
+            (["opencode", "run", "--variant", "xhigh"], "xhigh"),
+            (["opencode", "run", "--variant=minimal", "x"], "minimal"),
+            (["opencode", "run", "--variant", "--print-logs"], None),
+            (["opencode", "run", "--variant="], None),
+            (["opencode", "run", "--variant"], None),
+            (["opencode", "run"], None),
+            (["codex", "-c", "model_reasoning_effort=high"], "high"),
+        ]:
+            self.assertEqual(want, effective_reasoning_effort_from_command(argv), argv)
 
 
 if __name__ == "__main__":
