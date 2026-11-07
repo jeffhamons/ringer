@@ -124,6 +124,73 @@ class CodexCommandPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "engine_args may not set the model"):
                 self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
 
+    def test_attached_and_equals_model_forms_in_engine_args_are_rejected(self) -> None:
+        cases = (
+            ["-m", "gpt-6.1-sol", "-mgpt-5.5"],
+            ["-mgpt-5.5"],
+            ["-cmodel=gpt-5.5"],
+            ["-c", " model = gpt-5.5"],
+            ["--config=model=gpt-5.5"],
+            ["--config= model =gpt-5.5"],
+            ["--config", "model=gpt-5.5"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "engine_args may not set the model"):
+                    self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
+
+    def test_other_config_and_routing_flags_in_engine_args_are_rejected(self) -> None:
+        cases = (
+            ["-c", "model_provider=other"],
+            ["--config=model_provider=other"],
+            ["-cmodel_provider=other"],
+            ["--oss"],
+            ["--profile", "x"],
+            ["--profile=x"],
+            ["-p", "x"],
+            ["-px"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "engine_args may only"):
+                    self.check(codex_like(), model="gpt-6.1-sol", engine_args=args)
+
+    def test_command_scan_catches_attached_model_in_template(self) -> None:
+        template = ("-mgpt-5.5",) + CODEX_TEMPLATE
+        with self.assertRaisesRegex(ValueError, "gpt-5.5"):
+            self.check(codex_like(template=template), model="gpt-6.1-sol")
+
+    def test_config_model_never_satisfies_the_model_flag_presence_check(self) -> None:
+        base = tuple(i for i in CODEX_TEMPLATE if i != "{model_args}")
+        for prefix in (("-c", "model={model}"), ("--config", "model={model}"), ("-cmodel={model}",)):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(ValueError, "no -m model"):
+                    self.check(codex_like(template=prefix + base), model="gpt-6.1-sol")
+
+    def test_command_scan_catches_config_model_spellings_in_template(self) -> None:
+        for prefix in (("-cmodel=gpt-5.5",), ("-c=model=gpt-5.5",), ("--config=model=gpt-5.5",)):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(ValueError, "gpt-5.5"):
+                    self.check(codex_like(template=prefix + CODEX_TEMPLATE), model="gpt-6.1-sol")
+
+    def test_reasoning_effort_must_be_an_enum_value(self) -> None:
+        for value in ("low", "medium", "high", "xhigh", '"high"', "'low'"):
+            with self.subTest(value=value):
+                self.check(codex_like(), model="gpt-6.1-sol",
+                           engine_args=["-c", f"model_reasoning_effort={value}"])
+        for value in ("low\nmodel=gpt-5.5", "high extra", "turbo", "", "low\n"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "engine_args may only"):
+                    self.check(codex_like(), model="gpt-6.1-sol",
+                               engine_args=["-c", f"model_reasoning_effort={value}"])
+
+    def test_writable_roots_engine_args_still_allowed(self) -> None:
+        self.check(
+            codex_like(),
+            model="gpt-6.1-sol",
+            engine_args=["-c", 'sandbox_workspace_write.writable_roots=["/tmp/x"]'],
+        )
+
     def test_reasoning_effort_engine_args_still_allowed(self) -> None:
         self.check(codex_like(), model="gpt-6.1-sol", engine_args=["-c", "model_reasoning_effort=low"])
 
@@ -223,6 +290,30 @@ class CodexModelPolicyTests(unittest.TestCase):
             build("gpt-5.5")
         self.assertEqual("gpt-6.1-sol", build("gpt-6.1-sol").tasks[0].model)
         self.assertEqual("", build(None).tasks[0].model)
+
+    def test_every_ask_effort_choice_passes_validation(self) -> None:
+        packet = ringer.ContextPacket(
+            text="q", packet_bytes=1, source_bytes=0, selected=(), skipped=()
+        )
+        self.assertIn("minimal", ringer.ASK_REASONING_EFFORT_CHOICES)
+        for effort in ringer.ASK_REASONING_EFFORT_CHOICES:
+            manifest = ringer.one_request_manifest(
+                packet=packet,
+                workdir=Path(self.root),
+                engine="codex",
+                timeout_s=60,
+                reasoning_effort=effort,
+                model="gpt-6.1-sol",
+                redact=False,
+            )
+            validate_manifest_engines(manifest, config_with_default("gpt-6.1-sol"))
+
+    def test_effort_allowlist_still_rejects_bad_values(self) -> None:
+        rx = ringer.CODEX_ALLOWED_CONFIG_RE
+        for good in ("minimal", "low", "medium", "high", "xhigh"):
+            self.assertTrue(rx.match(f"model_reasoning_effort={good}"), good)
+        for bad in ("max", "none", "lowx", "low,model=x", ""):
+            self.assertFalse(rx.match(f"model_reasoning_effort={bad}"), bad)
 
 
 if __name__ == "__main__":

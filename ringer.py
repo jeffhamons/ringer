@@ -13019,21 +13019,50 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             )
 
 
+CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+ASK_REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high")
+
+CODEX_ALLOWED_CONFIG_RE = re.compile(
+    r"(model_reasoning_effort=([\"']?)(" + "|".join(CODEX_REASONING_EFFORTS) + r")\2\Z"
+    r"|sandbox_workspace_write\.writable_roots=)"
+)
+
+
+def codex_model_override(item: str) -> bool:
+    """True for any argv spelling that sets the codex model."""
+    return (
+        item in {"-m", "--model"}
+        or bool(re.match(r"-m.+", item))
+        or item.startswith("--model=")
+        or bool(re.match(r"\s*model\s*=", item))
+        or bool(re.match(r"-c\s*model\s*=", item))
+        or bool(re.match(r"--config=\s*model\s*=", item))
+    )
+
+
 def codex_command_policy_error(task: TaskSpec, engine: EngineConfig) -> str:
     """Check the argv that will actually run, not just the declared model."""
     if not is_codex_engine(engine.name, engine):
         return ""
     allowed = ", ".join(CODEX_ALLOWED_MODELS)
 
-    def model_override(item: str) -> bool:
-        return item in {"-m", "--model"} or item.startswith("--model=") or bool(
-            re.match(r"\s*model\s*=", item)
-        )
-
-    if any(model_override(item) for item in task.engine_args):
+    args = list(task.engine_args)
+    if any(codex_model_override(item) for item in args):
         return (
             f"{task.key}: codex engine_args may not set the model (-m/--model/-c model=); "
             f"the only allowed codex model is {allowed}, set via the task's \"model\" field."
+        )
+    index = 0
+    while index < len(args):
+        item = args[index]
+        value = args[index + 1] if index + 1 < len(args) else ""
+        if item in {"-c", "--config"} and CODEX_ALLOWED_CONFIG_RE.match(value):
+            index += 2
+            continue
+        return (
+            f"{task.key}: codex engine_args may only be -c model_reasoning_effort=... "
+            f"(or -c sandbox_workspace_write.writable_roots=...); {item!r} could change the "
+            f"model or provider. The only allowed codex model is {allowed}."
         )
     command = build_worker_command(
         engine,
@@ -13048,13 +13077,27 @@ def codex_command_policy_error(task: TaskSpec, engine: EngineConfig) -> str:
         for i, item in enumerate(command)
         if item in {"-m", "--model"}
     ] + [item.removeprefix("--model=") for item in command if item.startswith("--model=")]
+    models += [item[2:] for item in command if re.match(r"-m.+", item)]
+    # Only CLI model flags (above) satisfy the presence check; -c/--config
+    # values below feed the rejection list only.
+    config_models: list[str] = []
+    for i, item in enumerate(command):
+        value = (
+            command[i + 1] if item in {"-c", "--config"} and i + 1 < len(command)
+            else item[2:].removeprefix("=") if item.startswith("-c") and len(item) > 2
+            else item.removeprefix("--config=") if item.startswith("--config=")
+            else ""
+        )
+        found = re.match(r"\s*model\s*=\s*(.*)", value)
+        if found:
+            config_models.append(found.group(1).strip().strip("\"'"))
     if not models:
         return (
             f"{task.key}: codex command passes no -m model, so ~/.codex/config.toml would "
             f"pick the model; add {{model_args}} to engines.{engine.name}.args_template "
             f"(allowed model: {allowed})."
         )
-    bad = [m for m in models if m not in CODEX_ALLOWED_MODELS]
+    bad = [m for m in models + config_models if m not in CODEX_ALLOWED_MODELS]
     if bad:
         return (
             f"{task.key}: codex command would run model {bad[0]!r}; the only allowed "
@@ -14511,7 +14554,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--model", help="Model override (codex, or an opencode model slug)")
     ask_parser.add_argument(
         "--reasoning-effort",
-        choices=("minimal", "low", "medium", "high"),
+        choices=ASK_REASONING_EFFORT_CHOICES,
         default="low",
         help="Codex reasoning effort (default: low)",
     )
