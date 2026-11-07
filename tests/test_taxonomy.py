@@ -59,7 +59,7 @@ def row(
         "verdict": "PASS",
         "duration_ms": 10,
         "worker_tokens": 20,
-        "logged_at": f"2026-07-0{min(len(run_id), 9)}T10:00:00+00:00",
+        "logged_at": f"2026-10-0{min(len(run_id), 9)}T10:00:00+00:00",
     }
 
 
@@ -336,7 +336,65 @@ class WilsonTierTests(unittest.TestCase):
         now = "2026-11-07T00:00:00+00:00"
         self.assertTrue(evidence_is_stale("2026-01-01T00:00:00+00:00", now=now))
         self.assertFalse(evidence_is_stale("2026-10-20T00:00:00+00:00", now=now))
-        self.assertFalse(evidence_is_stale("", now=now))
+        # A missing or unparseable date counts as stale, never fresh.
+        self.assertTrue(evidence_is_stale("", now=now))
+        self.assertTrue(evidence_is_stale("not-a-date", now=now))
+
+
+class EvidenceWindowAndPerTypeTests(unittest.TestCase):
+    def typed_rows(self, model: str, task_type: str, verdicts: list[str], *, logged_at: str | None = "2026-10-10T10:00:00+00:00") -> list[dict[str, object]]:
+        out = []
+        for i, verdict in enumerate(verdicts):
+            item = row(f"{model}-{task_type}-{i}", model=model, engine="opencode", task_type=task_type)
+            item["task_key"] = f"{task_type}-{i}"
+            item["verdict"] = verdict
+            if logged_at is None:
+                item.pop("logged_at")
+            else:
+                item["logged_at"] = logged_at
+            out.append(item)
+        return out
+
+    def test_old_passes_do_not_support_a_model_after_a_recent_fail(self) -> None:
+        old = self.typed_rows("openrouter/a/aging", "code-fix", ["PASS"] * 10, logged_at="2026-08-01T10:00:00+00:00")
+        recent = self.typed_rows("openrouter/a/aging", "code-fix", ["FAIL"], logged_at="2026-11-01T10:00:00+00:00")
+        recent[0]["task_key"] = "recent"
+        item = aggregate_model_scoreboard_rows(old + recent)[0]
+        self.assertEqual(11, item["tasks"])
+        self.assertEqual(1, item["evidence_tasks"])
+        self.assertEqual("UNTESTED", item["evidence_status"])
+        self.assertEqual("probation", item["tier"])
+
+    def test_undated_rows_are_outside_the_window(self) -> None:
+        undated = self.typed_rows("openrouter/a/undated", "code-fix", ["PASS"] * 10, logged_at=None)
+        item = aggregate_model_scoreboard_rows(undated)[0]
+        self.assertEqual(0, item["evidence_tasks"])
+        self.assertEqual("UNTESTED", item["evidence_status"])
+        self.assertTrue(item["evidence_stale"])
+
+    def test_pooled_row_does_not_carry_one_types_support_to_the_others(self) -> None:
+        model = "openrouter/a/mixed"
+        rows = self.typed_rows(model, "code-fix", ["PASS"] * 40) + self.typed_rows(model, "docs", ["FAIL"] * 12)
+        item = aggregate_model_scoreboard_rows(rows)[0]
+        by_type = {t["task_type"]: t for t in item["task_types"]}
+        self.assertEqual("SUPPORTED", by_type["code-fix"]["evidence_status"])
+        self.assertEqual("CONTRADICTED", by_type["docs"]["evidence_status"])
+        self.assertGreater(by_type["code-fix"]["evidence_lower"], 0.45)
+        self.assertLess(by_type["docs"]["evidence_upper"], 0.45)
+        self.assertEqual("CONTRADICTED", item["evidence_status"])
+        self.assertEqual("probation", item["tier"])
+
+    def test_pooled_row_is_supported_only_if_every_tested_type_is(self) -> None:
+        model = "openrouter/a/solid"
+        rows = self.typed_rows(model, "code-fix", ["PASS"] * 12) + self.typed_rows(model, "docs", ["PASS"] * 12)
+        self.assertEqual("SUPPORTED", aggregate_model_scoreboard_rows(rows)[0]["evidence_status"])
+        # A type below n=8 is ignored; pooled n alone (no type at n>=8) is only PROVISIONAL.
+        thin = self.typed_rows("openrouter/a/thin", "code-fix", ["PASS"] * 5) + self.typed_rows("openrouter/a/thin", "docs", ["PASS"] * 5)
+        item = aggregate_model_scoreboard_rows(thin)[0]
+        self.assertEqual("PROVISIONAL", item["evidence_status"])
+        self.assertEqual("probation", item["tier"])
+        filtered = aggregate_model_scoreboard_rows(rows, task_type="code-fix")[0]
+        self.assertEqual("SUPPORTED", filtered["evidence_status"])
 
 
 class MeasuredCostTests(unittest.TestCase):

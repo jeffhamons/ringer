@@ -9416,9 +9416,41 @@ def evidence_is_stale(last_seen: Any, now: Any = None) -> bool:
 
     seen = parse(last_seen)
     if seen is None:
-        return False
+        return True  # a missing or unparseable date counts as stale
     current = parse(now) or datetime.now(timezone.utc)
     return (current - seen).days > EVIDENCE_STALE_DAYS
+
+
+EVIDENCE_WINDOW_START = "2026-09-01T00:00:00+00:00"
+EVIDENCE_STATUS_ORDER = {"CONTRADICTED": 0, "PROVISIONAL": 1, "SUPPORTED": 2}
+
+
+def parse_evidence_time(value: Any) -> datetime | None:
+    text = model_log_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def evidence_in_window(logged_at: Any) -> bool:
+    """One fixed window for now (EVIDENCE_WINDOW_START); a missing or
+    unparseable date is stale, never in-window."""
+    seen = parse_evidence_time(logged_at)
+    start = parse_evidence_time(EVIDENCE_WINDOW_START)
+    return seen is not None and start is not None and seen >= start
+
+
+def window_evidence(tasks: int, first_try_passed: int) -> tuple[str, float | None, float | None]:
+    """Status plus 80% Wilson bounds over in-window tasks only."""
+    status = model_scoreboard_status(tasks, first_try_passed / tasks if tasks else 0.0)
+    if tasks <= 0:
+        return status, None, None
+    lower, upper = wilson_interval(first_try_passed, tasks)
+    return status, lower, upper
 
 
 def model_scoreboard_tier(tasks: int, first_try_pass_rate: float) -> str:
@@ -9472,6 +9504,8 @@ def aggregate_model_scoreboard_rows(
                 "failed": 0,
                 "retries": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
                 "_duration_ms": [],
                 "_tokens": [],
@@ -9491,6 +9525,8 @@ def aggregate_model_scoreboard_rows(
                 "passed": 0,
                 "failed": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
             },
         )
@@ -9542,6 +9578,8 @@ def aggregate_model_scoreboard_rows(
                 "failed": 0,
                 "retries": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
                 "_duration_ms": [],
                 "_tokens": [],
@@ -9561,12 +9599,17 @@ def aggregate_model_scoreboard_rows(
                 "passed": 0,
                 "failed": 0,
                 "first_try_passed": 0,
+                "w_tasks": 0,
+                "w_first_passed": 0,
                 "last_seen": "",
             },
         )
         passed = model_log_text(final.get("verdict")).upper() == "PASS"
         first_passed = model_log_text(first.get("verdict")).upper() == "PASS"
+        in_window = evidence_in_window(final.get("logged_at"))
         for target in (model_entry, breakdown):
+            target["w_tasks"] += 1 if in_window else 0
+            target["w_first_passed"] += 1 if in_window and first_passed else 0
             target["tasks"] += 1
             target["attempts"] += len(ordered)
             target["passed"] += 1 if passed else 0
@@ -9602,6 +9645,9 @@ def aggregate_model_scoreboard_rows(
         breakdown_rows = []
         for breakdown in entry["_task_types"].values():
             b_tasks = int(breakdown["tasks"])
+            b_status, b_lower, b_upper = window_evidence(
+                breakdown["w_tasks"], breakdown["w_first_passed"]
+            )
             breakdown_rows.append(
                 {
                     "task_type": breakdown["task_type"],
@@ -9612,6 +9658,10 @@ def aggregate_model_scoreboard_rows(
                     "failed": breakdown["failed"],
                     "first_try_pass_rate": breakdown["first_try_passed"] / b_tasks if b_tasks else 0.0,
                     "pass_rate": breakdown["passed"] / b_tasks if b_tasks else 0.0,
+                    "evidence_tasks": breakdown["w_tasks"],
+                    "evidence_status": b_status,
+                    "evidence_lower": b_lower,
+                    "evidence_upper": b_upper,
                     "last_seen": breakdown["last_seen"],
                 }
             )
@@ -9632,10 +9682,30 @@ def aggregate_model_scoreboard_rows(
             if measured_cost is not None and entry["_cost_attempts"] and costed_p > 0
             else None
         )
+        # Status is judged per task type over the evidence window. The pooled
+        # row (no --task-type filter) reports the WORST status among the types
+        # with n >= EVIDENCE_MIN_TASKS (PROVISIONAL when none has), so a high-n
+        # model cannot clear the floor on one type and carry that to the rest.
+        pooled_status, pooled_lower, pooled_upper = window_evidence(
+            entry["w_tasks"], entry["w_first_passed"]
+        )
+        if task_type is None:
+            typed = [
+                row["evidence_status"]
+                for row in breakdown_rows
+                if row["evidence_status"] != "UNTESTED"
+            ]
+            if typed:
+                pooled_status = min(
+                    typed, key=lambda status: EVIDENCE_STATUS_ORDER.get(status, 0)
+                )
+            elif pooled_status != "UNTESTED":
+                pooled_status = "PROVISIONAL"
+            pooled_lower = pooled_upper = None
         tier = (
             "unranked"
             if entry["unattributed"] or (entry["invalidated_rows"] and not tasks_count)
-            else model_scoreboard_tier(tasks_count, first_try_rate)
+            else ("proven" if pooled_status == "SUPPORTED" else "probation")
         )
         finalized.append(
             {
@@ -9648,7 +9718,10 @@ def aggregate_model_scoreboard_rows(
                 "tier": tier,
                 "measured_cost_per_task": measured_cost,
                 "expected_cost_per_verified_pass": expected_cost,
-                "evidence_status": model_scoreboard_status(tasks_count, first_try_rate),
+                "evidence_status": pooled_status,
+                "evidence_lower": pooled_lower,
+                "evidence_upper": pooled_upper,
+                "evidence_tasks": entry["w_tasks"],
                 "evidence_stale": evidence_is_stale(entry["last_seen"]),
                 "tasks": tasks_count,
                 "attempts": entry["attempts"],
