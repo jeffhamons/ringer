@@ -8508,6 +8508,7 @@ def create_read_model_schema(conn: Any) -> None:
             verdict TEXT,
             duration_ms INTEGER,
             worker_tokens INTEGER,
+            cost_usd REAL,
             evidence_excluded INTEGER,
             invalidated_at TEXT,
             invalidation_reason TEXT,
@@ -8570,6 +8571,13 @@ def create_read_model_schema(conn: Any) -> None:
         conn.execute("ALTER TABLE attempts ADD COLUMN expected_model TEXT")
     if not read_model_column_exists(conn, "attempts", "evidence_excluded"):
         conn.execute("ALTER TABLE attempts ADD COLUMN evidence_excluded INTEGER")
+    if not read_model_column_exists(conn, "attempts", "cost_usd"):
+        conn.execute("ALTER TABLE attempts ADD COLUMN cost_usd REAL")
+        # Rows ingested before this column existed have no cost; dropping the
+        # stored fingerprint makes the next sync rebuild from the JSONL log.
+        conn.execute(
+            "DELETE FROM sync_state WHERE key IN ('log_prefix_sha256', 'log_mtime_ns')"
+        )
     if not read_model_column_exists(conn, "attempts", "invalidated_at"):
         conn.execute("ALTER TABLE attempts ADD COLUMN invalidated_at TEXT")
     if not read_model_column_exists(conn, "attempts", "invalidation_reason"):
@@ -8661,6 +8669,13 @@ def read_catalog_events_from_offset(path: Path, offset: int) -> tuple[list[dict[
     return events, final_offset
 
 
+def row_cost_usd(row: dict[str, Any]) -> float | None:
+    value = row.get("cost_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
     payloads: list[tuple[Any, ...]] = []
     for row in rows:
@@ -8679,6 +8694,7 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
                 model_log_text(row.get("verdict")),
                 model_log_int(row.get("duration_ms")),
                 model_log_int(row.get("worker_tokens")),
+                row_cost_usd(row),
                 1 if model_log_row_is_invalidated(row) else 0,
                 model_log_text(row.get("invalidated_at")) or None,
                 model_log_text(row.get("invalidation_reason")) or None,
@@ -8691,10 +8707,10 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
             INSERT INTO attempts (
                 run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                 reasoning_effort, task_type, retry,
-                verdict, duration_ms, worker_tokens, evidence_excluded, invalidated_at,
+                verdict, duration_ms, worker_tokens, cost_usd, evidence_excluded, invalidated_at,
                 invalidation_reason, orchestrator
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payloads,
         )
@@ -9062,7 +9078,7 @@ def db_attempt_rows(
         query = """
             SELECT run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                    reasoning_effort, task_type, retry,
-                   verdict, duration_ms, worker_tokens, evidence_excluded, invalidated_at,
+                   verdict, duration_ms, worker_tokens, cost_usd, evidence_excluded, invalidated_at,
                    invalidation_reason, orchestrator
             FROM attempts
         """
@@ -9086,6 +9102,7 @@ def db_attempt_rows(
                 "verdict": row["verdict"],
                 "duration_ms": row["duration_ms"],
                 "worker_tokens": row["worker_tokens"],
+                "cost_usd": row["cost_usd"],
                 "evidence_excluded": bool(row["evidence_excluded"]),
                 "invalidated_at": row["invalidated_at"],
                 "invalidation_reason": row["invalidation_reason"],
