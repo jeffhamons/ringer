@@ -274,11 +274,11 @@ There is no default model. Do not pick from memory or from a candidate list.
    rung; retry the same model once only for infra, flakiness or a fixed spec or
    checker bug. Do not re-ask Jeff per job when the rung is SUPPORTED or a
    Jeff-approved unexpired PROVISIONAL.
-3. DeepSeek V4.1 Flash's intended effort is max, but max is a blocked default until the A1 max lanes
-   run clean (an opencode server fault, not evidence against max). Until then pass
-   `engine_args ["--variant", "high"]` and state "effort high (fallback; max blocked)" at launch;
-   switch to `max` when routing.toml unblocks it. Effort is not a step-up: a first-try
-   failure steps straight to the next model.
+3. Run each rung at the effort routing.toml lists. On opencode pass
+   `engine_args ["--variant", "<effort>"]`; `default` or no listed effort means no
+   engine_args. Use the rung's model slug exactly: `deepseek-v4.1-flash-1017` and the
+   bare `deepseek-v4.1-flash` alias are separate catalog entries. Effort is not a
+   step-up: a first-try failure steps straight to the next model.
 4. Cross-cutting step-up is Grok while it has quota; on ENGINE_DOWN or quota
    errors go to Codex (OpenAI harness) or Opus 5.5 (Claude harness). Codex
    means only gpt-6.1-sol on the ChatGPT harness, never through opencode. Codex
@@ -335,8 +335,8 @@ model ran one model under three competitors' names).
 Engines are config blocks (`[engines.<name>]` in config.toml), selectable
 per task via the manifest `engine` field. Defaults are deliberate:
 
-- **codex** (default): strongest general worker. Use per-task `engine_args`
-  to set reasoning effort — spend it on hard tasks, not boilerplate.
+- **codex** (default): strongest general worker. Set reasoning effort only
+  where routing.toml lists one for the rung (Engine selection step 3).
 - **opencode**: the universal lane — any OpenRouter model via the `model`
   field; the routing file picks the slug. Always name the model explicitly.
   Validate a model new to you with a trivial one-task manifest before
@@ -348,8 +348,8 @@ per task via the manifest `engine` field. Defaults are deliberate:
   background explanation. Treat roughly 4,000 characters, three independent
   behavior contracts, or three owned production files as a warning that the
   lane should be split or moved to a stronger model. This is a judgment
-  threshold, not a lint rule. Use low reasoning from the first launch for a
-  mechanical copy/edit/test lane; do not discover that setting only after a
+  threshold, not a lint rule. Set effort at the first launch to what
+  routing.toml lists (Engine selection step 3); do not discover it only after a
   long stall.
 - Match `timeout_s` to the task: conversational harness tasks and
   build-and-test checks need far more than file edits.
