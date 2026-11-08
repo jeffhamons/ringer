@@ -509,7 +509,7 @@ Every community PR that lands in main is credited here — that's a project rule
 - [@chriscfellows](https://github.com/chriscfellows) (Chris Fellows) — validation of per-task engine arguments (#122)
 - [@jeffhamons](https://github.com/jeffhamons) (Jeff Hamons) — run-shepherd guidance and local integration (#143)
 - [@bigjohn-lab](https://github.com/bigjohn-lab) (John Carlson) — staged repo-feature output (#112)
-- [@Poncho1112](https://github.com/Poncho1112) (Poncho1112) — `ringer.py amend` for mis-scored attempts, Claude Code token usage recording, single-pass worker-command placeholders, and lint for five costly manifest mistakes
+- [@Poncho1112](https://github.com/Poncho1112) (Poncho1112) — `ringer.py amend` for mis-scored attempts (#156), Claude Code token usage recording (#155), single-pass worker-command placeholders (#158), and lint for five costly manifest mistakes (#157)
 - Joshua Pierce — company legal name in the license notice
 - [@radandmark](https://github.com/radandmark) (Mark Chadwick) — worktree manifest validation (#110)
 - [@bluemihai](https://github.com/bluemihai) (Mihai Banulescu) — captured-output redaction (#130)
