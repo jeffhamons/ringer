@@ -274,10 +274,9 @@ There is no default model. Do not pick from memory or from a candidate list.
    rung; retry the same model once only for infra, flakiness or a fixed spec or
    checker bug. Do not re-ask Jeff per job when the rung is SUPPORTED or a
    Jeff-approved unexpired PROVISIONAL.
-3. DeepSeek V4.1 Flash's intended effort is max, but max is a blocked default until the A1 max lanes
-   run clean (an opencode server fault, not evidence against max). Until then pass
-   `engine_args ["--variant", "high"]` and state "effort high (fallback; max blocked)" at launch;
-   switch to `max` when routing.toml unblocks it. Effort is not a step-up: a first-try
+3. Run each rung at the effort routing.toml lists: DeepSeek V4.1 Flash (the routed
+   `-1017` slug, not the `deepseek-v4.1-flash` alias) at max since 2026-11-07, via
+   `engine_args ["--variant", "max"]`. Effort is not a step-up: a first-try
    failure steps straight to the next model.
 4. Cross-cutting step-up is Grok while it has quota; on ENGINE_DOWN or quota
    errors go to Codex (OpenAI harness) or Opus 5.5 (Claude harness). Codex
