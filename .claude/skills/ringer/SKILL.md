@@ -335,8 +335,8 @@ model ran one model under three competitors' names).
 Engines are config blocks (`[engines.<name>]` in config.toml), selectable
 per task via the manifest `engine` field. Defaults are deliberate:
 
-- **codex** (default): strongest general worker. Use per-task `engine_args`
-  to set reasoning effort — spend it on hard tasks, not boilerplate.
+- **codex** (default): strongest general worker. Set reasoning effort only
+  where routing.toml lists one for the rung (Engine selection step 3).
 - **opencode**: the universal lane — any OpenRouter model via the `model`
   field; the routing file picks the slug. Always name the model explicitly.
   Validate a model new to you with a trivial one-task manifest before
@@ -348,8 +348,8 @@ per task via the manifest `engine` field. Defaults are deliberate:
   background explanation. Treat roughly 4,000 characters, three independent
   behavior contracts, or three owned production files as a warning that the
   lane should be split or moved to a stronger model. This is a judgment
-  threshold, not a lint rule. Use low reasoning from the first launch for a
-  mechanical copy/edit/test lane; do not discover that setting only after a
+  threshold, not a lint rule. Set effort at the first launch to what
+  routing.toml lists (Engine selection step 3); do not discover it only after a
   long stall.
 - Match `timeout_s` to the task: conversational harness tasks and
   build-and-test checks need far more than file edits.
